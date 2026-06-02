@@ -967,11 +967,19 @@ static esp_err_t httpd_resp_send_spiffs_file(httpd_req_t *req, char *path)
 
     char buf[FILE_CHUNK_SIZE]; // the size of chunk
     while (!feof(fp) && !ferror(fp)) {
-        fread(buf, FILE_CHUNK_SIZE - 1, 1, fp);
-        buf[FILE_CHUNK_SIZE - 1] = '\0';
-        httpd_resp_sendstr_chunk(req, buf);
-        memset(buf, 0, sizeof(buf));
+        size_t read_len = fread(buf, 1, sizeof(buf), fp);
+        if (read_len > 0) {
+            esp_err_t err = httpd_resp_send_chunk(req, buf, read_len);
+            if (err != ESP_OK) {
+                fclose(fp);
+                return err;
+            }
+        }
     };
+    if (ferror(fp)) {
+        fclose(fp);
+        return ESP_FAIL;
+    }
     return fclose(fp) == 0 ? ESP_OK : ESP_FAIL;
 }
 
@@ -1086,6 +1094,11 @@ static esp_err_t default_urls_get_handler(httpd_req_t *req)
         return index_html_get_handler(req, index_path);
     } else if (strcmp(info.file_name, "/index.html") == 0) {
         return index_html_get_handler(req, info.file_path);
+    } else if (strcmp(info.file_name, "/docs/developer") == 0 || strcmp(info.file_name, "/docs/developer/") == 0) {
+        char index_path[FILEPATH_MAX_SIZE];
+        strcpy(index_path, ((http_server_data_t *)req->user_ctx)->base_path);
+        strcat(index_path, "/index.html");
+        return index_html_get_handler(req, index_path);
     } else if (strcmp(info.file_name, "/static/style.css") == 0) {
         return style_css_get_handler(req, info.file_path);
     } else if (strcmp(info.file_name, "/static/restful.js") == 0) {
