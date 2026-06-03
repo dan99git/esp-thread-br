@@ -30,6 +30,8 @@ components/**/sdkconfig.old
 examples/**/sdkconfig
 examples/**/sdkconfig.old
 examples/**/build
+examples/**/build-*/
+examples/**/managed_components/
 
 # gcov coverage reports
 *.gcda

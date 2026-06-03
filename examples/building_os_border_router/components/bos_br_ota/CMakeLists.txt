@@ -1,0 +1,18 @@
+idf_component_register(
+    SRCS
+        "bos_br_ota.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        app_update
+        bootloader_support
+        bos_server_registration
+        esp_app_format
+        esp_http_client
+        esp_http_server
+        esp_partition
+        esp_system
+        freertos
+        json
+        mbedtls
+)

@@ -1,0 +1,9 @@
+idf_component_register(
+    SRCS
+        "bos_thread_dataset_anchor.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        nvs_flash
+        openthread
+)

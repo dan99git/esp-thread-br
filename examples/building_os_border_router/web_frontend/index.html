@@ -1,0 +1,744 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Building OS Border Router</title>
+  <link rel="icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/restful.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="rail">
+      <div class="brand">
+        <div class="mark">BOS</div>
+        <div>
+          <strong>Building OS</strong>
+          <span>Thread Border Router</span>
+        </div>
+      </div>
+      <nav class="nav" aria-label="Primary">
+        <button class="nav-item active" data-tab="overview">Overview</button>
+        <button class="nav-item" data-tab="commissioning">Commissioning</button>
+        <button class="nav-item" data-tab="devices">Devices</button>
+        <button class="nav-item" data-tab="network">Network</button>
+        <button class="nav-item" data-tab="ledger">Ledger</button>
+        <button class="nav-item" data-tab="developer">Developer</button>
+        <button class="nav-item" data-tab="dev">Dev</button>
+        <button class="nav-item" data-tab="licensing">Licensing</button>
+      </nav>
+      <div class="rail-foot">
+        <span id="device-endpoint">port 80</span>
+        <span>BOS diagnostics on <span id="diagnostics-endpoint">port 80</span></span>
+        <span>Raw Thread controls are fenced in Dev.</span>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">border-router surface</p>
+          <h1>Building OS Thread Gateway</h1>
+        </div>
+        <div class="actions">
+          <button class="ghost" id="refresh-all">Refresh</button>
+          <a class="primary" id="diagnostics-link" href="/">Diagnostics</a>
+        </div>
+      </header>
+
+      <section class="tab active" id="tab-overview">
+        <div class="hero">
+          <div>
+            <p class="eyebrow">operator path</p>
+            <h2>Commission floating hardware into the active site package without treating every nearby Thread network as safe to join.</h2>
+          </div>
+          <div class="status-pill" id="overall-status">checking</div>
+        </div>
+
+        <div class="metric-grid">
+          <article class="metric">
+            <span>Thread role</span>
+            <strong id="metric-role">unknown</strong>
+            <small id="metric-network">network pending</small>
+          </article>
+          <article class="metric">
+            <span>Backbone</span>
+            <strong id="metric-backbone">unknown</strong>
+            <small id="metric-backbone-detail">waiting for BOS diagnostics</small>
+          </article>
+          <article class="metric">
+            <span>BOS registration</span>
+            <strong id="metric-registered">unknown</strong>
+            <small id="metric-firmware">building-os-border-router</small>
+          </article>
+          <article class="metric">
+            <span>Floating devices</span>
+            <strong id="metric-floating">0</strong>
+            <small id="metric-floating-detail">SRP peer feed pending</small>
+          </article>
+          <article class="metric">
+            <span>Ledger</span>
+            <strong id="metric-ledger">none</strong>
+            <small id="metric-ledger-detail">no active digest</small>
+          </article>
+        </div>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>Commissioning Model</h3>
+              <p>Reachable hardware stays floating until the site package expects it, the operator identifies it, and the spatial identity is imprinted.</p>
+            </div>
+          </div>
+          <ol class="workflow">
+            <li><span>1</span><strong>Activate site package</strong><small>Imported `.recad` gives planned fittings and expected product identity.</small></li>
+            <li><span>2</span><strong>Discover floating hardware</strong><small>The BR can see hardware on the mesh, but that is not a pairing decision.</small></li>
+            <li><span>3</span><strong>Gate by model_id</strong><small>Only exact expected matches become pairing-ready; surplus or missing identity stays held back.</small></li>
+            <li><span>4</span><strong>Identify in place</strong><small>Flash/blink the fitting and confirm the physical position one by one.</small></li>
+            <li><span>5</span><strong>Imprint and deploy</strong><small>Write the spatial identity, register the device, then push the compiled ledger.</small></li>
+          </ol>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>OpenThread Status</h3>
+              <p>Core network values reported by the retained OpenThread REST API.</p>
+            </div>
+            <button id="refresh-thread">Refresh Thread</button>
+          </div>
+          <div class="kv-grid" id="thread-summary"></div>
+        </section>
+      </section>
+
+      <section class="tab" id="tab-commissioning">
+        <div class="hero slim">
+          <div>
+            <p class="eyebrow">commissioning queue</p>
+            <h2>Read-only queue shape for active package, floating devices, pairing-ready matches, and holdbacks.</h2>
+          </div>
+          <button id="refresh-commissioning">Refresh Queue</button>
+        </div>
+
+        <div class="metric-grid">
+          <article class="metric">
+            <span>Active site package</span>
+            <strong id="site-package-state">not connected</strong>
+            <small id="site-package-detail">BR firmware has no site-package endpoint yet</small>
+          </article>
+          <article class="metric">
+            <span>Pairing-ready</span>
+            <strong id="pairing-ready-count">0</strong>
+            <small>exact expected model matches</small>
+          </article>
+          <article class="metric">
+            <span>Floating</span>
+            <strong id="floating-count">0</strong>
+            <small id="floating-source">source pending</small>
+          </article>
+          <article class="metric">
+            <span>Held back</span>
+            <strong id="holdback-count">0</strong>
+            <small>missing, surplus, or mismatched identity</small>
+          </article>
+        </div>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>Pairing-Ready Candidates</h3>
+              <p>These rows should only appear after a floating device model_id exactly matches an unpaired planned fitting.</p>
+            </div>
+            <span class="badge warn">read-only first</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Hardware</th><th>model_id</th><th>Planned match</th><th>Next action</th><th>Source</th></tr></thead>
+              <tbody id="commissioning-ready"><tr><td colspan="5">No pairing-ready candidates reported.</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>Floating Devices</h3>
+              <p>Floating means visible on the backbone but not yet registered into the persistent device estate.</p>
+            </div>
+            <span class="badge" id="peers-source-badge">/bos/peers</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Hardware</th><th>model_id</th><th>Transport</th><th>State</th><th>Reason</th></tr></thead>
+              <tbody id="floating-devices"><tr><td colspan="5">No floating devices reported.</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>Holdbacks</h3>
+              <p>Held-back hardware remains reachable for inspection but cannot be paired until the active package and product identity agree.</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Hardware</th><th>model_id</th><th>Holdback reason</th><th>Resolution</th></tr></thead>
+              <tbody id="holdback-devices"><tr><td colspan="4">No holdbacks reported.</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section class="tab" id="tab-devices">
+        <div class="hero slim">
+          <div>
+            <p class="eyebrow">device manager bridge</p>
+            <h2>The BR should expose what it can see; the site server remains the authority for registered and spatial identity.</h2>
+          </div>
+          <button id="refresh-devices">Refresh Devices</button>
+        </div>
+
+        <section class="split">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>BR Device Feed</h3>
+                <p>Current firmware exposes `/bos/peers` from SRP/TMFS DNS-SD browse. Ledger progress appears when leaves publish ledger TXT.</p>
+              </div>
+            </div>
+            <div class="kv-grid" id="device-feed-summary"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>Identity Boundaries</h3>
+                <p>Hardware identity, spatial identity, product identity, and transport address are separate values.</p>
+              </div>
+            </div>
+            <ul class="plain-list">
+              <li><strong>Hardware:</strong> unique device identifier used to find a physical unit.</li>
+              <li><strong>Product:</strong> broadcast model_id used for strict expected-match checks.</li>
+              <li><strong>Spatial:</strong> assigned only after pairing to a planned position.</li>
+              <li><strong>Transport:</strong> current address/path, never identity evidence.</li>
+            </ul>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>Registered Estate Access</h3>
+              <p>Optional read-only site-server lookup separates registered spatial devices from floating discovery while the BR remains the local mesh observer.</p>
+            </div>
+            <span class="badge warn" id="site-estate-state">not configured</span>
+          </div>
+          <form id="site-estate-form" class="form-grid compact site-estate-form">
+            <label>Site server URL <input id="site-server-url" name="siteServerUrl" placeholder="http://127.0.0.1:7085"></label>
+            <label>API key <input id="site-api-key" name="siteApiKey" type="password" autocomplete="off" placeholder="optional x-api-key"></label>
+            <div class="form-actions">
+              <button type="submit">Read Estate</button>
+              <button type="button" class="ghost" id="site-estate-clear">Clear</button>
+            </div>
+            <p class="form-note">Reads only: <code>/api/devices</code>, <code>/api/commissioning/discovered</code>, and BR placement/convergence endpoints. Pairing and imprint writes stay on the protected site-server flow.</p>
+          </form>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Surface</th><th>API</th><th>Status</th><th>Use</th></tr></thead>
+              <tbody>
+                <tr><td>Discovered floating devices</td><td><code>/bos/peers</code></td><td id="devices-peer-state">pending</td><td>Commissioning queue input</td></tr>
+                <tr><td>Registered site devices</td><td><code>/api/devices</code></td><td id="devices-registry-state">not configured</td><td>Persistent device manager</td></tr>
+                <tr><td>Site floating discovery</td><td><code>/api/commissioning/discovered</code></td><td id="devices-discovered-state">not configured</td><td>Site-server commissioning cache</td></tr>
+                <tr><td>BR infrastructure placement</td><td><code>/api/border-routers/:id/infrastructure</code></td><td id="devices-br-placement-state">not configured</td><td>Backbone placement, not spatial pairing</td></tr>
+                <tr><td>BR server convergence</td><td><code>/api/border-routers/:id/convergence</code></td><td id="devices-br-convergence-state">not configured</td><td>Stored latest swarm report</td></tr>
+                <tr><td>Commissioning actions</td><td><code>/api/commissioning/*</code></td><td>site server only</td><td>Identify, pair, imprint, ledger push</td></tr>
+                <tr><td>BR local diagnostics</td><td><code>/bos/status</code></td><td id="devices-diag-state">checking</td><td>BR health and backbone state</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section class="tab" id="tab-network">
+        <div class="hero slim">
+          <div>
+            <p class="eyebrow">infrastructure</p>
+            <h2>Ethernet is the management and site-server path; Thread is the low-power device mesh.</h2>
+          </div>
+          <button id="load-topology">Load Topology</button>
+        </div>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>Network Summary</h3>
+              <p>Address-first status for the BR, without treating addresses as device identity.</p>
+            </div>
+          </div>
+          <div class="kv-grid" id="network-summary"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>API and CLI Surface</h3>
+              <p>Everything the UI reads should be callable by a CLI or Codex plugin without screen scraping.</p>
+            </div>
+            <span class="badge">JSON first</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Function</th><th>BR API</th><th>CLI shape</th><th>Status</th></tr></thead>
+              <tbody>
+                <tr><td>BR health</td><td><code>/bos/status</code></td><td><code>bos br status --host &lt;br&gt;</code></td><td>available</td></tr>
+                <tr><td>Ledger seed</td><td><code>/bos/ledger/active</code></td><td><code>bos br status --host &lt;br&gt;</code></td><td>available</td></tr>
+                <tr><td>Floating peers</td><td><code>/bos/peers</code></td><td><code>bos br status --host &lt;br&gt;</code></td><td>SRP/TMFS browse table</td></tr>
+                <tr><td>Estate join</td><td><code>/bos/ledger/torrent</code> + site reads</td><td><code>bos br estate --host &lt;br&gt; --server &lt;site-server&gt;</code></td><td>read-only registered/floating split</td></tr>
+                <tr><td>BR placement</td><td><code>/api/border-routers/:id/infrastructure</code></td><td><code>bos br server-placement --server &lt;site-server&gt; --id &lt;br&gt;</code></td><td>site-server infrastructure record</td></tr>
+                <tr><td>Thread properties</td><td><code>/get_properties</code></td><td><code>bos br thread --host &lt;br&gt;</code></td><td>upstream API</td></tr>
+                <tr><td>Thread scan</td><td><code>/available_network</code></td><td><code>bos br networks --host &lt;br&gt;</code></td><td>dev-only context</td></tr>
+                <tr><td>Topology</td><td><code>/node_information</code>, <code>/topology</code></td><td><code>bos br topology --host &lt;br&gt;</code></td><td>upstream API</td></tr>
+                <tr><td>Pair/imprint</td><td><code>/api/commissioning/*</code></td><td>site-server command needed</td><td>not on BR firmware</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>Topology</h3>
+              <p>Thread node and diagnostic snapshots from the upstream REST API.</p>
+            </div>
+          </div>
+          <div class="metric-grid compact-metrics">
+            <article class="metric"><span>Network</span><strong id="topology-network">unknown</strong><small>Thread name</small></article>
+            <article class="metric"><span>Leader</span><strong id="topology-leader">unknown</strong><small>router id</small></article>
+            <article class="metric"><span>Routers</span><strong id="topology-router-count">unknown</strong><small>diagnostic count</small></article>
+          </div>
+          <pre id="topology-json">No topology loaded.</pre>
+        </section>
+      </section>
+
+      <section class="tab" id="tab-ledger">
+        <section class="torrent-client" aria-label="Ledger torrent client">
+          <div class="torrent-menubar">
+            <strong>Ledger Torrent</strong>
+            <span>Swarm</span>
+            <span>View</span>
+            <span>Tools</span>
+          </div>
+
+          <div class="torrent-toolbar" role="toolbar" aria-label="Ledger torrent controls">
+            <button id="refresh-ledger" title="Refresh ledger torrent rows">Refresh</button>
+            <button class="ghost" data-torrent-filter="all" title="Show all nodes">All</button>
+            <button class="ghost" data-torrent-filter="downloading" title="Show nodes still receiving chunks">Leeching</button>
+            <button class="ghost" data-torrent-filter="completed" title="Show nodes with the target ledger">Completed</button>
+            <button class="ghost" data-torrent-filter="error" title="Show failed nodes">Errors</button>
+            <span class="torrent-toolbar-spacer"></span>
+            <span class="torrent-chip">Seeder <strong id="torrent-seeder">BR</strong></span>
+            <span class="torrent-chip">Version <strong id="torrent-version">none</strong></span>
+            <span class="torrent-chip">State <strong id="torrent-state">none</strong></span>
+          </div>
+
+          <div class="torrent-layout">
+            <aside class="torrent-sidebar" aria-label="Ledger torrent filters">
+              <button class="torrent-filter active" data-torrent-filter="all">
+                <span>All nodes</span><strong data-torrent-count="all">0</strong>
+              </button>
+              <button class="torrent-filter" data-torrent-filter="infrastructure">
+                <span>Infrastructure</span><strong data-torrent-count="infrastructure">0</strong>
+              </button>
+              <button class="torrent-filter" data-torrent-filter="registered">
+                <span>Registered</span><strong data-torrent-count="registered">0</strong>
+              </button>
+              <button class="torrent-filter" data-torrent-filter="floating">
+                <span>Floating</span><strong data-torrent-count="floating">0</strong>
+              </button>
+              <button class="torrent-filter" data-torrent-filter="pairing-ready">
+                <span>Pairing-ready</span><strong data-torrent-count="pairing-ready">0</strong>
+              </button>
+              <button class="torrent-filter" data-torrent-filter="holdback">
+                <span>Holdback</span><strong data-torrent-count="holdback">0</strong>
+              </button>
+              <button class="torrent-filter" data-torrent-filter="ineligible">
+                <span>Ineligible</span><strong data-torrent-count="ineligible">0</strong>
+              </button>
+              <button class="torrent-filter" data-torrent-filter="downloading">
+                <span>Leeching</span><strong data-torrent-count="downloading">0</strong>
+              </button>
+              <button class="torrent-filter" data-torrent-filter="completed">
+                <span>Completed</span><strong data-torrent-count="completed">0</strong>
+              </button>
+              <button class="torrent-filter" data-torrent-filter="stale">
+                <span>Stale</span><strong data-torrent-count="stale">0</strong>
+              </button>
+              <button class="torrent-filter" data-torrent-filter="offline">
+                <span>Offline</span><strong data-torrent-count="offline">0</strong>
+              </button>
+              <button class="torrent-filter" data-torrent-filter="error">
+                <span>Error</span><strong data-torrent-count="error">0</strong>
+              </button>
+
+              <div class="torrent-source-list">
+                <span>Feeds</span>
+                <small>/bos/ledger/torrent</small>
+                <small>/bos/convergence</small>
+                <small>/bos/peers</small>
+                <small id="torrent-site-source">site server not configured</small>
+              </div>
+            </aside>
+
+            <section class="torrent-main" aria-label="Ledger torrent rows">
+              <div class="torrent-progress">
+                <span>Downloaded:</span>
+                <div class="progress-track"><div id="torrent-overall-progress" class="progress-fill" style="width:0%"></div></div>
+                <strong id="torrent-overall-percent">0.0%</strong>
+              </div>
+
+              <div class="torrent-target-line">
+                <span id="torrent-seeder-state">waiting</span>
+                <code id="torrent-digest">no digest</code>
+                <span id="torrent-peer-count">0 peers</span>
+              </div>
+
+              <div class="table-wrap torrent-table-wrap">
+                <table class="torrent-table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Size to down</th>
+                      <th>Done</th>
+                      <th>Status</th>
+                      <th>Down speed</th>
+                      <th>Up speed</th>
+                      <th>Seeds</th>
+                      <th>Peers</th>
+                      <th>ETA</th>
+                      <th>Ratio</th>
+                      <th>Priority</th>
+                      <th>Queue position</th>
+                      <th>Size left</th>
+                    </tr>
+                  </thead>
+                  <tbody id="torrent-peers"><tr><td colspan="13">No peers reported.</td></tr></tbody>
+                </table>
+              </div>
+            </section>
+          </div>
+
+          <section class="torrent-inspector" aria-label="Selected ledger torrent details">
+            <div class="torrent-detail-tabs">
+              <button class="active" data-torrent-detail="general">General</button>
+              <button data-torrent-detail="trackers">Trackers</button>
+              <button data-torrent-detail="peers">Peers</button>
+              <button data-torrent-detail="files">Files</button>
+              <button data-torrent-detail="statistics">Statistics</button>
+            </div>
+            <div class="torrent-selected-progress">
+              <span id="torrent-selected-name">No node selected</span>
+              <div class="progress-track"><div id="torrent-selected-progress" class="progress-fill" style="width:0%"></div></div>
+              <strong id="torrent-selected-percent">0.0%</strong>
+            </div>
+            <div id="torrent-detail-body" class="torrent-detail-body"></div>
+          </section>
+
+          <div class="torrent-statusbar">
+            <span id="torrent-status-download">D: 0.0 KB/s</span>
+            <span id="torrent-status-upload">U: 0.0 KB/s</span>
+            <span id="torrent-status-selected">Selected: none</span>
+            <span id="torrent-status-done">Done: 0 b</span>
+            <span id="torrent-status-remaining">Remaining: 0 b</span>
+          </div>
+        </section>
+      </section>
+
+      <section class="tab" id="tab-developer">
+        <div class="hero slim">
+          <div>
+            <p class="eyebrow">docs/developer</p>
+            <h2>Development notes for the BR surface, commissioning path, AI control plane, and ledger distribution work.</h2>
+          </div>
+          <span class="status-pill warn">living notes</span>
+        </div>
+
+        <div class="metric-grid">
+          <article class="metric">
+            <span>BR UI</span>
+            <strong>port 80</strong>
+            <small>served from web_storage SPIFFS</small>
+          </article>
+          <article class="metric">
+            <span>BOS diagnostics</span>
+            <strong>port 80</strong>
+            <small>/bos/status and ledger testbed endpoints</small>
+          </article>
+          <article class="metric">
+            <span>Site server</span>
+            <strong>Fastify</strong>
+            <small>default 7085, not FastAPI</small>
+          </article>
+          <article class="metric">
+            <span>Agent surface</span>
+            <strong>CLI + REST + skills</strong>
+            <small>JSON first, no screen scraping</small>
+          </article>
+          <article class="metric">
+            <span>Ledger route</span>
+            <strong>target: BR seed</strong>
+            <small>ingress and mesh serving present; leaf pull pending</small>
+          </article>
+        </div>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>Current Build Notes</h3>
+              <p>These are implementation facts for this firmware and host tree, not general Thread assumptions.</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Surface</th><th>Current state</th><th>Developer note</th></tr></thead>
+              <tbody>
+                <tr><td>Port 80 BR UI</td><td>Building OS SPA over retained upstream BR server</td><td>Root, index, CSS, JS, and favicon are served by the current dispatcher.</td></tr>
+                <tr><td>Diagnostics server</td><td><code>/bos/status</code>, <code>/bos/ledger/active</code>, <code>/bos/convergence</code>, <code>/bos/peers</code></td><td>Health, ledger, SRP/TMFS peer, and convergence JSON on port 80.</td></tr>
+                <tr><td>OpenThread tools</td><td>Retained in Dev</td><td>Scan, join, form, prefix, and topology are low-level maintenance controls.</td></tr>
+                <tr><td>Site server</td><td>Fastify REST server</td><td>Do not add a separate FastAPI service. Add protected OpenAPI to Fastify if route discovery is needed.</td></tr>
+                <tr><td>CLI</td><td><code>bos br status/thread/networks/topology/estate</code></td><td>Current commands are read-only and mirror the UI data sources.</td></tr>
+                <tr><td>Swagger/OpenAPI</td><td>Not present</td><td>Target shape is protected <code>/openapi.json</code> and dev/protected docs, not primary UX.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>Working Decisions</h3>
+              <p>Keep the operator workflow above the raw Thread controls.</p>
+            </div>
+          </div>
+          <ul class="plain-list doc-list">
+            <li><strong>Raw Thread join is not BOS commissioning:</strong> discovered Thread networks can be nearby Nest or other fabrics. Normal BOS commissioning must not press Join on random scan results.</li>
+            <li><strong>Floating hardware is not registered hardware:</strong> reachable devices stay floating until the active site package expects them and the installer confirms the physical unit.</li>
+            <li><strong>Spatial identity is assigned during pairing:</strong> hardware identity is used to find the unit; spatial identity is written only after binding to the planned position.</li>
+            <li><strong>Hex transport IDs are not BOS identity:</strong> Thread addresses, RLOC values, PAN IDs, and XPAN IDs are diagnostics, not the persistent device identity.</li>
+            <li><strong>Ethernet is the BR upstream path:</strong> the BR bridges site-server management to Thread devices. It is not the general Wi-Fi AP for high-bandwidth devices.</li>
+            <li><strong>AI control must be surface-neutral:</strong> an agent should use skills, CLI, REST, and WebSocket/event data. The UI should describe the workflow but not become the only control path.</li>
+            <li><strong>Ledger distribution target is BR as primary seed:</strong> the site server should push a verified ledger to the BR, then the BR advertises and serves it to mesh nodes.</li>
+          </ul>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>BR Commissioning Workflow</h3>
+              <p>The BR is infrastructure. It should be claimed to the site network, not paired as a room fitting.</p>
+            </div>
+          </div>
+          <ol class="workflow docs-workflow">
+            <li><span>1</span><strong>Boot on Ethernet</strong><small>Confirm IP, upstream reachability, and BOS diagnostics on port 80.</small></li>
+            <li><span>2</span><strong>Find site server</strong><small>Use configured URL or discovery, then register through the site-server API.</small></li>
+            <li><span>3</span><strong>Claim infrastructure</strong><small>Bind the BR to site/building/level/network segment/cabinet metadata.</small></li>
+            <li><span>4</span><strong>Provision trust</strong><small>Persist token/API credentials and require them for future writes.</small></li>
+            <li><span>5</span><strong>Verify Thread</strong><small>Check dataset, channel, role, RCP, and on-mesh reachability.</small></li>
+            <li><span>6</span><strong>Expose floating queue</strong><small>Report visible hardware without turning visibility into pairing.</small></li>
+            <li><span>7</span><strong>Deploy ledger</strong><small>Receive, validate, store, advertise, and seed the active ledger.</small></li>
+            <li><span>8</span><strong>Report convergence</strong><small>Publish seed/leech/stale/offline state back to the site server.</small></li>
+          </ol>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>Ledger and Swarm Glossary</h3>
+              <p>Terms shown in the Ledger tab are transfer state, not identity state.</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Term</th><th>Meaning</th><th>Healthy reading</th></tr></thead>
+              <tbody>
+                <tr><td>Swarm</td><td>Current ledger transfer group for the bench firmware path.</td><td>BR and online C6 nodes converge on one ledger version and digest.</td></tr>
+                <tr><td>Node</td><td>A transfer participant: BR or C6 leaf.</td><td>It is not a spatial ID.</td></tr>
+                <tr><td>Role</td><td><code>seed</code>, <code>leech</code>, <code>current</code>, <code>stale</code>, <code>offline</code>, or <code>failed</code>.</td><td>BR is normally <code>seed</code> after active ledger load.</td></tr>
+                <tr><td>Version</td><td><code>ledger_version</code> held or requested by that node.</td><td>Matches the BR active version.</td></tr>
+                <tr><td>Digest</td><td><code>manifest_digest</code> fingerprint for the exact artifact.</td><td>Matches the BR digest. Same version with different digest is a fault.</td></tr>
+                <tr><td>State</td><td>Current transfer condition.</td><td>BR: <code>seedable</code> or <code>seeding</code>; leaves: <code>current</code> after validation.</td></tr>
+                <tr><td>seed</td><td>Node has the current ledger and can serve it.</td><td>BR has active ledger and mesh serving is healthy.</td></tr>
+                <tr><td>none / no digest</td><td>No active ledger metadata is available.</td><td>Expected until ledger ingress is implemented or a ledger is pushed.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="split">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>Known Gaps</h3>
+                <p>Do not hide these behind UI copy.</p>
+              </div>
+            </div>
+            <ul class="plain-list doc-list">
+              <li><strong>Ledger ingress:</strong> <code>/bos/ledger/push</code> now stages to the inactive partition and swaps active metadata, but full zcbor decode, replay/downgrade checks, audit, and hardware verification are still pending.</li>
+              <li><strong>Mesh serving:</strong> the BR seed resources <code>/mesh/ledger/manifest</code>, <code>/mesh/ledger/chunk</code>, and <code>/mesh/have</code> are present; XIAO source now pulls and activates the BR ledger over CoAP, pending hardware proof.</li>
+              <li><strong>Convergence:</strong> SRP/TMFS DNS-SD browse now feeds peer rows; XIAO source publishes staging and active ledger TXT keys for <code>lv</code>, <code>ld</code>, <code>have</code>, and <code>chunks</code>, pending live peer-row verification.</li>
+              <li><strong>Auth:</strong> BR claim stores a device token and sends it on status and convergence heartbeats; production still needs role/policy, audit, rotation, and transport hardening.</li>
+              <li><strong>Offline handling:</strong> firmware now posts convergence snapshots to the site server; stale/offline timing still needs hardware proof with real peer rows.</li>
+              <li><strong>BR identity:</strong> the site server stores BR placement in a dedicated infrastructure record; the compatibility device row is not a luminaire spatial identity.</li>
+            </ul>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>Next Implementation Order</h3>
+                <p>Shortest path to a BR an agent can operate without guessing.</p>
+              </div>
+            </div>
+            <ol class="plain-list numbered-list">
+              <li>Protect BR writes with device token/API key handling.</li>
+              <li>Connect BR infrastructure placement to the site manager and agent policy surfaces.</li>
+              <li>Add full ledger envelope decode, replay/downgrade checks, audit, and rollback policy.</li>
+              <li>Add leaf TXT publication for <code>lv</code>, <code>ld</code>, <code>have</code>, and <code>chunks</code>.</li>
+              <li>Verify SRP/TMFS peer rows and ledger progress on hardware.</li>
+              <li>Prove stale/offline timing and convergence reporting on hardware.</li>
+              <li>Add protected OpenAPI plus a <code>border-router</code> skill that calls CLI/REST.</li>
+              <li>Flash and verify the unified port 80 UI and BOS diagnostics routes on hardware.</li>
+            </ol>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>Developer Commands</h3>
+              <p>Commands used to validate this surface and the current BR CLI path.</p>
+            </div>
+          </div>
+          <div class="command-grid">
+            <code>npm run build --workspace @building-os/bos</code>
+            <code>npm run test --workspace @building-os/bos</code>
+            <code>npm run lint --workspace @building-os/bos</code>
+            <code>bos br status --host &lt;br&gt;</code>
+            <code>bos br thread --host &lt;br&gt;</code>
+            <code>bos br networks --host &lt;br&gt;</code>
+            <code>bos br topology --host &lt;br&gt;</code>
+            <code>bos br estate --host &lt;br&gt; --server &lt;site-server&gt;</code>
+            <code>idf.py -B build-s3-codex build</code>
+          </div>
+          <p class="form-note">The new port-80 UI appears on hardware only after rebuilding and flashing the BR firmware and web_storage image.</p>
+        </section>
+      </section>
+
+      <section class="tab" id="tab-dev">
+        <div class="hero slim warn-hero">
+          <div>
+            <p class="eyebrow">dev and debug</p>
+            <h2>Raw upstream Thread controls. Use for bench recovery and diagnostics, not normal BOS commissioning.</h2>
+          </div>
+          <span class="status-pill warn">dev only</span>
+        </div>
+
+        <section class="split">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>Network Operations</h3>
+                <p>Form a test network or update the on-mesh prefix through upstream OpenThread APIs.</p>
+              </div>
+            </div>
+            <form id="network-form" class="form-grid">
+              <label>Network name <input name="networkName" value="OpenThread-0x99"></label>
+              <label>Network key <input name="networkKey" value="00112233445566778899aabbccddeeff"></label>
+              <label>PAN ID <input name="panId" value="0x1234"></label>
+              <label>Channel <input name="channel" type="number" value="15"></label>
+              <label>Extended PAN ID <input name="extPanId" value="1111111122222222"></label>
+              <label>Passphrase <input name="passphrase" value="j01Nme"></label>
+              <label class="wide">On-mesh prefix <input name="prefix" value="fd11:22::"></label>
+              <label class="check"><input type="checkbox" name="defaultRoute" checked> default route</label>
+              <button type="button" id="form-network">Form Network</button>
+            </form>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h3>Prefix Control</h3>
+                <p>Apply or remove the routed prefix advertised to Thread nodes.</p>
+              </div>
+            </div>
+            <form id="prefix-form" class="form-grid compact">
+              <label class="wide">Prefix <input name="prefix" value="fd11:22::"></label>
+              <label class="check"><input type="checkbox" name="defaultRoute" checked> default route</label>
+              <button type="button" id="add-prefix">Add Prefix</button>
+              <button type="button" class="danger" id="delete-prefix">Delete Prefix</button>
+            </form>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>External Thread Networks</h3>
+              <p>This is the upstream `/available_network` scan. Rows may be nearby Nest or other fabrics, not Wi-Fi.</p>
+            </div>
+            <button id="scan-networks">Scan</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>No.</th><th>Name</th><th>Ext PAN ID</th><th>PAN ID</th><th>MAC</th><th>Channel</th><th>dBm</th><th>LQI</th><th>Action</th></tr>
+              </thead>
+              <tbody id="available-networks"><tr><td colspan="9">No scan yet.</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section class="tab" id="tab-licensing">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>Licensing</h3>
+              <p>Building OS product UI with retained upstream OpenThread BR implementation.</p>
+            </div>
+          </div>
+          <div class="copy">
+            <p>This firmware fork uses Espressif ESP Thread Border Router components and ESP-IDF/OpenThread runtime code. The control surface is branded and extended for Building OS.</p>
+            <p>Espressif attribution is retained for the upstream Thread Border Router implementation and supporting REST APIs.</p>
+          </div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="join-dialog">
+    <form method="dialog" id="join-form">
+      <h3>Dev Join Thread Network</h3>
+      <p id="join-network-name">Selected network</p>
+      <p class="form-note">This is raw upstream Thread joining. It is not the BOS floating-device pairing flow.</p>
+      <label>Credential
+        <select name="credentialType">
+          <option value="networkKeyType">Network key</option>
+          <option value="pskdType">Thread PSKd</option>
+        </select>
+      </label>
+      <label>Network key <input name="networkKey" value="00112233445566778899aabbccddeeff"></label>
+      <label>PSKd <input name="pskd" placeholder="optional"></label>
+      <label>Prefix <input name="prefix" value="fd11:22::"></label>
+      <label class="check"><input type="checkbox" name="defaultRoute" checked> default route</label>
+      <div class="dialog-actions">
+        <button value="cancel" class="ghost">Cancel</button>
+        <button value="join" id="join-submit">Join</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

@@ -3,31 +3,35 @@
 This is a Building OS fork of `espressif/esp-thread-br`.
 
 - Upstream: https://github.com/espressif/esp-thread-br
-- Fork base: tag `v1.3` (commit `446b44d`, January 2025, built against ESP-IDF v5.5.2).
-- Fork branch: `bos/v1.3`. All Building OS modifications are commits on this branch on top of the upstream `v1.3` tag.
+- Fork base: upstream `main`, with Building OS integration changes kept in this fork.
+- Building OS BR firmware example: `examples/building_os_border_router/`.
+- Building OS bare C6 TMFS bench peer: `examples/bos_c6_tmfs_test/`.
 - Upstream license: Apache 2.0 (see `LICENSE`). Preserved unmodified.
 
-To see Building OS changes vs the upstream `v1.3` baseline:
+To see Building OS changes vs the upstream remote:
 
 ```
-git log v1.3..bos/v1.3
+git log upstream/main..main
 ```
 
-Building OS components that wrap this fork live in the outer Building OS repository at `firmware/esp-thread-br-bos/components/`. The fork itself contains only the upstream code plus any patches needed to integrate with the Building OS firmware.
+Building OS firmware code lives in this repository, not in the outer Building OS
+monorepo. The outer Building OS repository may document the architecture and
+host-side APIs, but BR app firmware belongs here.
 
 ## Pulling upstream updates
 
-When Espressif releases a new tag (for example `v1.4`):
+When Espressif updates upstream:
 
 ```
 git fetch upstream
-git checkout -b bos/v1.4 v1.4
-git cherry-pick v1.3..bos/v1.3        # replay Building OS patches on the new base
-# resolve any conflicts, push the new branch
+git checkout main
+git merge upstream/main
+# resolve conflicts, validate examples/building_os_border_router, push main
 ```
 
-The outer Building OS repository's submodule pointer is then updated to track `bos/v1.4`.
+Do not put new BR firmware implementation in the outer Building OS repository.
 
 ## Canonical spec
 
-The Building OS border router architecture is specified in the outer repo at `docs/08.8-border-router.md`.
+The Building OS border router architecture is specified in the outer Building OS
+repo at `docs/08.8-border-router.md`.

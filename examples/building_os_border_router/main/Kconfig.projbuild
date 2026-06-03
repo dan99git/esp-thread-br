@@ -1,0 +1,18 @@
+menu "Building OS Border Router"
+
+    config BOS_SERVER_DEFAULT_URL
+        string "Building OS site server URL"
+        default "http://192.168.88.253:7085"
+        help
+            Fallback BOS site server URL used when bos_reg/server_url is not
+            present in NVS. Leave empty to disable firmware-initiated
+            registration until a server URL is provisioned.
+
+    config BOS_SERVER_API_KEY
+        string "Building OS site server API key"
+        default ""
+        help
+            Optional x-api-key value sent to the BOS site server. Use this
+            when the site server has API_KEY configured.
+
+endmenu
