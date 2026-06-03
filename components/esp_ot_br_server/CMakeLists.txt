@@ -1,4 +1,4 @@
-set(requires mdns fatfs spiffs esp_eth nvs_flash freertos openthread esp_http_server protocol_examples_common esp_wifi)
+set(requires mdns fatfs spiffs esp_eth nvs_flash freertos openthread esp_http_server protocol_examples_common esp_wifi esp_app_format esp_timer)
 set(ESP_OT_BR_WEB_FRONTEND_DIR "${CMAKE_CURRENT_SOURCE_DIR}/frontend")
 
 if(DEFINED BOS_BR_WEB_FRONTEND_DIR AND IS_DIRECTORY "${BOS_BR_WEB_FRONTEND_DIR}")

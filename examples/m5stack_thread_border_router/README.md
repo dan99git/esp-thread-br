@@ -10,23 +10,15 @@ The ePSKc can be generated via the touchscreen and is used to establish a DTLS s
 
 ### Hardware Required
 
-This example requires the M5Stack CoreS3 along with the ESP32-H2 Thread/Zigbee Gateway Module. Please refer to:
-
-- [M5Stack CoreS3](https://shop.m5stack.com/products/m5stack-cores3-esp32s3-lotdevelopment-kit)
+This example requires the [M5Stack Thread Border Router](https://shop.m5stack.com/products/m5stack-thread-border-router), a ready-to-use Thread Border Router solution built with the [M5Stack CoreS3](https://shop.m5stack.com/products/m5stack-cores3-esp32s3-lotdevelopment-kit) (ESP32-S3) and the [ESP32-H2 Thread/Zigbee Gateway Module](https://shop.m5stack.com/products/esp32-h2-thread-zigbee-gateway-module).
 
 <p align="center">
-  <img src="images/M5Stack-CoreS3.png" alt="M5Stack CoreS3" width="400"/>
-</p>
-
-- [ESP32-H2 Thread/Zigbee Gateway Module](https://shop.m5stack.com/products/esp32-h2-thread-zigbee-gateway-module)
-
-<p align="center">
-  <img src="images/ESP32-H2-Thread-Zigbee-Gateway-Module.png" alt="ESP32-H2 Thread/Zigbee Gateway Module" width="400"/>
+  <img src="images/M5Stack-Thread-Border-Router.png" alt="M5Stack Thread Border Router" width="400"/>
 </p>
 
 ### IDF Version Required
 
-This example requires [IDF v5.5.1](https://github.com/espressif/esp-idf/tree/v5.5.1). It may not be compatible with older or newer versions of IDF.
+This example requires [IDF v5.5.4](https://github.com/espressif/esp-idf/tree/v5.5.4). It may not be compatible with older or newer versions of IDF.
 
 ### Configure the Project
 
@@ -91,3 +83,9 @@ Please follow the steps below:
    - Set `PIN_TO_RCP_TX` to `18` and `PIN_TO_RCP_RX` to `17` via menuconfig.
 
 After that, build and flash as usual. The example will then operate using the Unit Gateway H2.
+
+---
+
+<a href="https://espressif.github.io/esp-launchpad/?flashConfigURL=https://espressif.github.io/esp-thread-br/launchpad/launchpad.toml">
+    <img alt="Try it with ESP Launchpad" src="https://espressif.github.io/esp-launchpad/assets/try_with_launchpad.png" width="250" height="70">
+</a>
