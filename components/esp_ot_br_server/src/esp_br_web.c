@@ -1271,6 +1271,9 @@ static httpd_handle_t *start_esp_br_http_server(const char *base_path, const cha
         (sizeof(s_resource_handlers) + sizeof(s_web_gui_handlers)) / sizeof(httpd_uri_t) + BOS_EXTERNAL_HANDLER_MAX + 2;
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.stack_size = 8 * 1024;
+    config.lru_purge_enable = true;
+    config.recv_wait_timeout = 2;
+    config.send_wait_timeout = 2;
     s_server.port = config.server_port;
 
     // start http_server
