@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "bos_ledger_ingress.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        bos_server_registration
+        esp_http_server
+        esp_partition
+        json
+        mbedtls
+        nvs_flash
+)

@@ -1,0 +1,20 @@
+menu "ESP Thread Border Router Web"
+
+    config ESP_BR_WEB_WRITE_AUTH
+        bool "Protect Thread write routes"
+        default y
+        help
+            Require a local admin password header before raw Thread write
+            routes can change node state, datasets, prefixes, commissioner
+            state, or network membership.
+
+    config ESP_BR_WEB_ADMIN_PASSWORD
+        string "Thread write-route admin password"
+        default ""
+        depends on ESP_BR_WEB_WRITE_AUTH
+        help
+            Password expected in the X-BOS-Admin-Password header for raw
+            Thread write routes. If left empty while write auth is enabled,
+            protected write routes reject every request.
+
+endmenu

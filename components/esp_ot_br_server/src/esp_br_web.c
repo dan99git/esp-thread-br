@@ -45,6 +45,8 @@
 #define SERVER_IPV4_LEN 16
 #define FILE_CHUNK_SIZE 4096
 #define WEB_TAG "obtr_web"
+#define BOS_ADMIN_PASSWORD_HEADER "X-BOS-Admin-Password"
+#define BOS_EXTERNAL_HANDLER_MAX 16
 
 /*-----------------------------------------------------
  Note：Http Server
@@ -68,6 +70,8 @@ typedef struct http_server {
 } http_server_t;
 
 static http_server_t s_server = {NULL, {"", ""}, "", 80}; /* the instance of server */
+static httpd_uri_t s_external_handlers[BOS_EXTERNAL_HANDLER_MAX];
+static uint8_t s_external_handler_count;
 
 /**
  * @brief The basic parameter definition for parsing url
@@ -101,6 +105,10 @@ static esp_err_t esp_otbr_network_node_baid_get_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_network_node_dataset_active_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_network_node_dataset_pending_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_network_node_dataset_handler(httpd_req_t *req, const char *dataset_type);
+static esp_err_t esp_otbr_network_node_delete_protected_handler(httpd_req_t *req);
+static esp_err_t esp_otbr_network_node_state_put_protected_handler(httpd_req_t *req);
+static esp_err_t esp_otbr_network_node_dataset_active_protected_handler(httpd_req_t *req);
+static esp_err_t esp_otbr_network_node_dataset_pending_protected_handler(httpd_req_t *req);
 
 static httpd_uri_t s_resource_handlers[] = {
     {
@@ -118,7 +126,7 @@ static httpd_uri_t s_resource_handlers[] = {
     {
         .uri = ESP_OT_REST_API_NODE_PATH,
         .method = HTTP_DELETE,
-        .handler = esp_otbr_network_node_delete_handler,
+        .handler = esp_otbr_network_node_delete_protected_handler,
         .user_ctx = NULL,
     },
     {
@@ -142,7 +150,7 @@ static httpd_uri_t s_resource_handlers[] = {
     {
         .uri = ESP_OT_REST_API_NODE_STATE_PATH,
         .method = HTTP_PUT,
-        .handler = esp_otbr_network_node_state_put_handler,
+        .handler = esp_otbr_network_node_state_put_protected_handler,
         .user_ctx = &s_server.data,
     },
     {
@@ -190,7 +198,7 @@ static httpd_uri_t s_resource_handlers[] = {
     {
         .uri = ESP_OT_REST_API_NODE_DATASET_ACTIVE_PATH,
         .method = HTTP_PUT,
-        .handler = esp_otbr_network_node_dataset_active_handler,
+        .handler = esp_otbr_network_node_dataset_active_protected_handler,
         .user_ctx = &s_server.data,
     },
     {
@@ -202,7 +210,7 @@ static httpd_uri_t s_resource_handlers[] = {
     {
         .uri = ESP_OT_REST_API_NODE_DATASET_PENDING_PATH,
         .method = HTTP_PUT,
-        .handler = esp_otbr_network_node_dataset_pending_handler,
+        .handler = esp_otbr_network_node_dataset_pending_protected_handler,
         .user_ctx = &s_server.data,
     },
 };
@@ -219,6 +227,11 @@ static esp_err_t esp_otbr_delete_network_prefix_post_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_network_commission_post_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_network_topology_get_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_current_node_get_handler(httpd_req_t *req);
+static esp_err_t esp_otbr_network_join_protected_handler(httpd_req_t *req);
+static esp_err_t esp_otbr_network_form_protected_handler(httpd_req_t *req);
+static esp_err_t esp_otbr_add_network_prefix_protected_handler(httpd_req_t *req);
+static esp_err_t esp_otbr_delete_network_prefix_protected_handler(httpd_req_t *req);
+static esp_err_t esp_otbr_network_commission_protected_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_ping_post_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_ipaddr_get_handler(httpd_req_t *req);
 static esp_err_t esp_otbr_add_ipaddr_post_handler(httpd_req_t *req);
@@ -240,31 +253,31 @@ static httpd_uri_t s_web_gui_handlers[] = {
     {
         .uri = ESP_OT_REST_API_JOIN_NETWORK_PATH,
         .method = HTTP_POST,
-        .handler = esp_otbr_network_join_post_handler,
+        .handler = esp_otbr_network_join_protected_handler,
         .user_ctx = &s_server.data,
     },
     {
         .uri = ESP_OT_REST_API_FORM_NETWORK_PATH,
         .method = HTTP_POST,
-        .handler = esp_otbr_network_form_post_handler,
+        .handler = esp_otbr_network_form_protected_handler,
         .user_ctx = &s_server.data,
     },
     {
         .uri = ESP_OT_REST_API_ADD_NETWORK_PREFIX_PATH,
         .method = HTTP_POST,
-        .handler = esp_otbr_add_network_prefix_post_handler,
+        .handler = esp_otbr_add_network_prefix_protected_handler,
         .user_ctx = &s_server.data,
     },
     {
         .uri = ESP_OT_REST_API_DELETE_NETWORK_PREFIX_PATH,
         .method = HTTP_POST,
-        .handler = esp_otbr_delete_network_prefix_post_handler,
+        .handler = esp_otbr_delete_network_prefix_protected_handler,
         .user_ctx = &s_server.data,
     },
     {
         .uri = ESP_OT_REST_API_COMMISSION_PATH,
         .method = HTTP_POST,
-        .handler = esp_otbr_network_commission_post_handler,
+        .handler = esp_otbr_network_commission_protected_handler,
         .user_ctx = &s_server.data,
     },
     {
@@ -1133,6 +1146,105 @@ static esp_err_t httpd_resp_send_spiffs_file(httpd_req_t *req, char *path)
     return fclose(fp) == 0 ? ESP_OK : ESP_FAIL;
 }
 
+esp_err_t esp_br_web_register_handler(const httpd_uri_t *uri)
+{
+    ESP_RETURN_ON_FALSE(uri && uri->uri && uri->handler, ESP_ERR_INVALID_ARG, WEB_TAG, "Invalid external URI");
+    ESP_RETURN_ON_FALSE(s_external_handler_count < BOS_EXTERNAL_HANDLER_MAX,
+                        ESP_ERR_NO_MEM,
+                        WEB_TAG,
+                        "Too many external URI handlers");
+
+    httpd_uri_t pending = *uri;
+    if (s_server.handle) {
+        ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_server.handle, &pending),
+                            WEB_TAG,
+                            "Failed to register external URI %s",
+                            pending.uri);
+    }
+
+    s_external_handlers[s_external_handler_count++] = pending;
+    return ESP_OK;
+}
+
+static esp_err_t require_write_auth(httpd_req_t *req)
+{
+#if CONFIG_ESP_BR_WEB_WRITE_AUTH
+    const char *password = CONFIG_ESP_BR_WEB_ADMIN_PASSWORD;
+    char provided[96];
+
+    if (password[0] == '\0') {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_type(req, ESP_OT_REST_CONTENT_TYPE_JSON);
+        httpd_resp_sendstr(req, "{\"error\":\"admin password is not configured\"}");
+        return ESP_FAIL;
+    }
+
+    if (httpd_req_get_hdr_value_str(req, BOS_ADMIN_PASSWORD_HEADER, provided, sizeof(provided)) != ESP_OK ||
+        strcmp(provided, password) != 0) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_type(req, ESP_OT_REST_CONTENT_TYPE_JSON);
+        httpd_resp_sendstr(req, "{\"error\":\"admin password required\"}");
+        return ESP_FAIL;
+    }
+#endif
+
+    return ESP_OK;
+}
+
+static esp_err_t esp_otbr_network_node_delete_protected_handler(httpd_req_t *req)
+{
+    esp_err_t err = require_write_auth(req);
+    return err == ESP_OK ? esp_otbr_network_node_delete_handler(req) : err;
+}
+
+static esp_err_t esp_otbr_network_node_state_put_protected_handler(httpd_req_t *req)
+{
+    esp_err_t err = require_write_auth(req);
+    return err == ESP_OK ? esp_otbr_network_node_state_put_handler(req) : err;
+}
+
+static esp_err_t esp_otbr_network_node_dataset_active_protected_handler(httpd_req_t *req)
+{
+    esp_err_t err = require_write_auth(req);
+    return err == ESP_OK ? esp_otbr_network_node_dataset_active_handler(req) : err;
+}
+
+static esp_err_t esp_otbr_network_node_dataset_pending_protected_handler(httpd_req_t *req)
+{
+    esp_err_t err = require_write_auth(req);
+    return err == ESP_OK ? esp_otbr_network_node_dataset_pending_handler(req) : err;
+}
+
+static esp_err_t esp_otbr_network_join_protected_handler(httpd_req_t *req)
+{
+    esp_err_t err = require_write_auth(req);
+    return err == ESP_OK ? esp_otbr_network_join_post_handler(req) : err;
+}
+
+static esp_err_t esp_otbr_network_form_protected_handler(httpd_req_t *req)
+{
+    esp_err_t err = require_write_auth(req);
+    return err == ESP_OK ? esp_otbr_network_form_post_handler(req) : err;
+}
+
+static esp_err_t esp_otbr_add_network_prefix_protected_handler(httpd_req_t *req)
+{
+    esp_err_t err = require_write_auth(req);
+    return err == ESP_OK ? esp_otbr_add_network_prefix_post_handler(req) : err;
+}
+
+static esp_err_t esp_otbr_delete_network_prefix_protected_handler(httpd_req_t *req)
+{
+    esp_err_t err = require_write_auth(req);
+    return err == ESP_OK ? esp_otbr_delete_network_prefix_post_handler(req) : err;
+}
+
+static esp_err_t esp_otbr_network_commission_protected_handler(httpd_req_t *req)
+{
+    esp_err_t err = require_write_auth(req);
+    return err == ESP_OK ? esp_otbr_network_commission_post_handler(req) : err;
+}
+
 /**
  * @brief Provide the index.html for GUI,when the client login the web.
  *
@@ -1258,6 +1370,11 @@ static esp_err_t default_urls_get_handler(httpd_req_t *req)
         strcpy(index_path, ((http_server_data_t *)req->user_ctx)->base_path);
         strcat(index_path, "/index.html");
         return index_html_get_handler(req, index_path);
+    } else if (strcmp(info.file_name, "/docs/developer") == 0 || strcmp(info.file_name, "/docs/developer/") == 0) {
+        char index_path[FILEPATH_MAX_SIZE];
+        strcpy(index_path, ((http_server_data_t *)req->user_ctx)->base_path);
+        strcat(index_path, "/index.html");
+        return index_html_get_handler(req, index_path);
     }
 
     /* Favicon: served from embedded binary */
@@ -1317,12 +1434,16 @@ static httpd_handle_t *start_esp_br_http_server(const char *base_path, const cha
     strlcpy(s_server.data.base_path, base_path, ESP_VFS_PATH_MAX + 1);
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = (sizeof(s_resource_handlers) + sizeof(s_web_gui_handlers)) / sizeof(httpd_uri_t) + 2;
-    config.max_resp_headers = (sizeof(s_resource_handlers) + sizeof(s_web_gui_handlers)) / sizeof(httpd_uri_t) + 2;
+    config.max_uri_handlers =
+        (sizeof(s_resource_handlers) + sizeof(s_web_gui_handlers)) / sizeof(httpd_uri_t) + BOS_EXTERNAL_HANDLER_MAX + 2;
+    config.max_resp_headers =
+        (sizeof(s_resource_handlers) + sizeof(s_web_gui_handlers)) / sizeof(httpd_uri_t) + BOS_EXTERNAL_HANDLER_MAX + 2;
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.stack_size = 8 * 1024;
     config.max_open_sockets = 7;
     config.lru_purge_enable = true;
+    config.recv_wait_timeout = 2;
+    config.send_wait_timeout = 2;
     s_server.port = config.server_port;
 
     esp_br_web_api_init();
@@ -1337,6 +1458,7 @@ static httpd_handle_t *start_esp_br_http_server(const char *base_path, const cha
 
     httpd_server_register_http_uri(&s_server, s_resource_handlers, sizeof(s_resource_handlers) / sizeof(httpd_uri_t));
     httpd_server_register_http_uri(&s_server, s_web_gui_handlers, sizeof(s_web_gui_handlers) / sizeof(httpd_uri_t));
+    httpd_server_register_http_uri(&s_server, s_external_handlers, s_external_handler_count);
     httpd_register_uri_handler(s_server.handle, &default_uris_get);
 
     // Show the login address in the console

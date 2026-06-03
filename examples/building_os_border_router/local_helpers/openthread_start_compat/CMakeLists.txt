@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "src/bos_openthread_compat.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        esp_netif
+        openthread
+        vfs
+)

@@ -58,6 +58,8 @@
 
 #define TAG "esp_ot_br"
 
+extern void ot_register_external_commands(void) __attribute__((weak));
+
 #if CONFIG_EXAMPLE_CONNECT_WIFI && CONFIG_OPENTHREAD_BR_AUTO_START
 /**
  * @brief Save Wi-Fi configuration to NVS and connect
@@ -203,7 +205,9 @@ void launch_openthread_border_router(const esp_openthread_config_t *config,
 #if CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
     esp_cli_custom_command_init();
 #endif
-    ot_register_external_commands();
+    if (ot_register_external_commands) {
+        ot_register_external_commands();
+    }
 #if CONFIG_OPENTHREAD_BR_AUTO_START
     xTaskCreate(ot_br_init, "ot_br_init", 6144, NULL, 4, NULL);
 #endif

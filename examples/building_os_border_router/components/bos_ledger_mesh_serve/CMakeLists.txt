@@ -1,0 +1,11 @@
+idf_component_register(
+    SRCS
+        "bos_ledger_mesh_serve.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        bos_ledger_ingress
+        esp_partition
+        freertos
+        openthread
+)

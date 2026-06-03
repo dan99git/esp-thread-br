@@ -1,0 +1,17 @@
+# Building OS Border Router partition table.
+# 8 MB flash, ESP32-S3.
+# Keeps upstream BR web/RCP partitions plus BOS ledger and dataset slots.
+# See docs/08.8-border-router.md section 7.
+#
+# Name,        Type, SubType,  Offset,   Size,    Flags
+nvs,           data, nvs,      0x9000,   0x6000,
+otadata,       data, ota,      0xf000,   0x2000,
+phy_init,      data, phy,      0x11000,  0x1000,
+ota_0,         app,  ota_0,    0x20000,  0x200000,
+ota_1,         app,  ota_1,    0x220000, 0x200000,
+web_storage,   data, spiffs,   0x420000, 0x32000,
+rcp_fw,        data, spiffs,   0x452000, 0xA0000,
+ledger_a,      data, 0x99,     0x4F2000, 0x10000,
+ledger_b,      data, 0x99,     0x502000, 0x10000,
+bos_thread,    data, 0x9A,     0x512000, 0x10000,
+spiffs,        data, spiffs,   0x522000, 0x2DE000,
