@@ -26,6 +26,10 @@ extern "C" {
 
 #define BOS_REG_HEARTBEAT_PERIOD_S 60
 
+// Heartbeats buffered in RAM while the site server is unreachable
+// (docs/08.8-border-router.md s12: capped at 60 entries, drops oldest).
+#define BOS_REG_HEARTBEAT_BUFFER_CAP 60
+
 esp_err_t bos_server_registration_init(void);
 
 // True if a device_token is persisted in NVS.
@@ -40,6 +44,11 @@ esp_err_t bos_server_registration_get_device_id(char *out, size_t out_len);
 
 // Copies the configured BOS site-server URL.
 esp_err_t bos_server_registration_get_server_url(char *out, size_t out_len);
+
+// Heartbeat buffer counters: entries currently held in the RAM ring and
+// total entries dropped to overflow since boot. Either out pointer may be
+// NULL. Safe to call from any task.
+void bos_server_registration_heartbeat_stats(uint32_t *buffered_count, uint32_t *dropped_count);
 
 #ifdef __cplusplus
 }

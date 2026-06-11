@@ -5,9 +5,11 @@ idf_component_register(
         "include"
     REQUIRES
         bos_br_ota
+        bos_commissioning
         bos_convergence_aggregator
         bos_ledger_ingress
         bos_server_registration
+        bos_thread_dataset_anchor
         esp_eth
         esp_event
         esp_http_server

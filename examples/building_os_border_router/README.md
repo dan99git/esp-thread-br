@@ -113,7 +113,7 @@ Observed `/bos/status` payload reports:
 - `backbone.connected`: `true`
 - `backbone.interface`: `example_netif_eth`
 - `registered`: `false`
-- `thread.role`: `not_polled`
+- `thread`: live runtime object (`role`, `network_name`, `panid`, `channel`, `rloc16`; never the network key), or `null` before OpenThread is up
 - `rcp.version`: `not_polled`
 - `ledger.state`: `none`
 
@@ -121,14 +121,15 @@ Observed `/bos/status` payload reports:
 
 | Component | Status |
 |-----------|-------------|
-| `bos_diagnostics_server` | Registers JSON endpoints on BR port 80. `/bos/status` includes read-only BR registration metadata so the UI can join site-server placement and convergence records. Thread/RCP fields deliberately not polled in request handlers yet |
+| `bos_diagnostics_server` | Registers JSON endpoints on BR port 80. `/bos/status` includes read-only BR registration metadata so the UI can join site-server placement and convergence records. `thread` is polled live from OpenThread; RCP version deliberately not polled in request handlers yet |
 | `bos_server_registration` | Claims the BR with the configured site server URL, persists `device_token`, sends status heartbeat with `X-Device-Token`, and posts convergence snapshots to `/api/border-routers/:id/convergence`; mDNS discovery is not implemented |
 | `bos_ledger_ingress` | Implements protected `POST /bos/ledger/push`, CBOR envelope body-digest validation, inactive-partition write, and active metadata swap |
 | `bos_ledger_mesh_serve` | Registers BR CoAP `/mesh/ledger/manifest`, `/mesh/ledger/chunk`, and `/mesh/have`; SRP TXT publish is still a warning stub |
 | `bos_convergence_aggregator` | Starts a DNS-SD browse task for `_mesh._udp` and `_tmfs._udp`, parses TXT into a bounded peer table, and renders `/bos/convergence`, `/bos/peers`, and `/bos/ledger/torrent` peer rows |
-| `bos_thread_dataset_anchor` | NVS read and write signatures present. Dataset load and save not implemented |
+| `bos_thread_dataset_anchor` | NVS dataset persistence plus the boot lifecycle: applies the persisted Operational Dataset (OT settings store first, NVS anchor as recovery) or forms a new network once and persists it, then starts Thread. Also provides the `/bos/status` `thread` runtime snapshot |
+| `bos_commissioning` (`bos_joiner.c`) | Phase 2b joiner acceptance per docs/06.2: token-authed `POST /bos/joiner/accept` (EUI-64 + operator-supplied PSKd, starts the OT Commissioner role on demand) and `GET /bos/joiner/status` (commissioner state, joiner table, queued entries) |
 
-Remaining stubs log warnings so the runtime does not silently pretend to provide BR SRP TXT publication or dataset anchoring.
+Remaining stubs log warnings so the runtime does not silently pretend to provide BR SRP TXT publication.
 
 ## Spec sections this firmware implements
 
