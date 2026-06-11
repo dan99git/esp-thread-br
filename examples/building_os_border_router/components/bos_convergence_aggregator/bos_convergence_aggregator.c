@@ -143,6 +143,22 @@ static bool parse_u32(const char *value, uint32_t *out)
     return true;
 }
 
+static bool parse_bool_txt(const char *value, bool *out)
+{
+    if (!value || !out) {
+        return false;
+    }
+    if (strcmp(value, "1") == 0 || strcmp(value, "true") == 0) {
+        *out = true;
+        return true;
+    }
+    if (strcmp(value, "0") == 0 || strcmp(value, "false") == 0) {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
 static bool is_zero_addr(const otIp6Address *addr)
 {
     static const uint8_t zero[16] = {0};
@@ -180,6 +196,18 @@ static void digest_hex(const uint8_t digest[BOS_LEDGER_DIGEST_LEN], char out[BOS
         out[i * 2 + 1] = hex[digest[i] & 0x0f];
     }
     out[BOS_LEDGER_DIGEST_LEN * 2] = '\0';
+}
+
+// Plain 32-hex-char form consumed by the XIAO mesh bootstrap parser
+// (hex_to_ip6_address in mesh_coap.c rejects the colon-separated form).
+static void ip6_to_plain_hex(const uint8_t addr[16], char out[33])
+{
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < 16U; i++) {
+        out[i * 2] = hex[addr[i] >> 4];
+        out[i * 2 + 1] = hex[addr[i] & 0x0f];
+    }
+    out[32] = '\0';
 }
 
 static bool digest_matches_target(const bos_peer_t *peer, const bos_ledger_active_t *active)
@@ -379,18 +407,41 @@ static void parse_txt_into_peer(bos_peer_t *peer, const uint8_t *txt, uint16_t t
         }
         char value[80];
         txt_value_to_cstr(&entry, value, sizeof(value));
+        // _mesh._udp TXT contract: class, model, pkg, ver, hw, mid, fw, http, cm.
+        // Reserved future ledger keys from the device service: lver, ldig.
         if (strcmp(entry.mKey, "class") == 0) {
+            copy_str(peer->device_class, sizeof(peer->device_class), value);
+        } else if (strcmp(entry.mKey, "dc") == 0 || strcmp(entry.mKey, "device_class") == 0) {
             copy_str(peer->device_class, sizeof(peer->device_class), value);
         } else if (strcmp(entry.mKey, "model") == 0) {
             copy_str(peer->model, sizeof(peer->model), value);
+        } else if (strcmp(entry.mKey, "mid") == 0 || strcmp(entry.mKey, "model_id") == 0) {
+            copy_str(peer->model_id, sizeof(peer->model_id), value);
         } else if (strcmp(entry.mKey, "pkg") == 0) {
             copy_str(peer->package_state, sizeof(peer->package_state), value);
         } else if (strcmp(entry.mKey, "ver") == 0 || strcmp(entry.mKey, "v") == 0) {
             copy_str(peer->service_version, sizeof(peer->service_version), value);
+        } else if (strcmp(entry.mKey, "fw") == 0 ||
+                   strcmp(entry.mKey, "firmware") == 0 ||
+                   strcmp(entry.mKey, "firmware_version") == 0) {
+            copy_str(peer->firmware_version, sizeof(peer->firmware_version), value);
+        } else if (strcmp(entry.mKey, "http") == 0) {
+            uint32_t port = 0;
+            if (parse_u32(value, &port) && port <= UINT16_MAX) {
+                peer->http_port = (uint16_t)port;
+                peer->has_http_port = true;
+            }
+        } else if (strcmp(entry.mKey, "cm") == 0 || strcmp(entry.mKey, "commissioned") == 0) {
+            bool commissioned = false;
+            if (parse_bool_txt(value, &commissioned)) {
+                peer->commissioned = commissioned;
+                peer->has_commissioned = true;
+            }
         } else if (strcmp(entry.mKey, "nid") == 0) {
             copy_str(peer->id, sizeof(peer->id), value);
         } else if (strcmp(entry.mKey, "hw") == 0 ||
                    strcmp(entry.mKey, "hid") == 0 ||
+                   strcmp(entry.mKey, "eui64") == 0 ||
                    strcmp(entry.mKey, "hardware_id") == 0) {
             copy_str(peer->hardware_id, sizeof(peer->hardware_id), value);
         } else if (strcmp(entry.mKey, "cat") == 0) {
@@ -496,6 +547,9 @@ static void merge_peer(const bos_peer_t *update)
     if (update->model[0] != '\0') {
         copy_str(peer->model, sizeof(peer->model), update->model);
     }
+    if (update->model_id[0] != '\0') {
+        copy_str(peer->model_id, sizeof(peer->model_id), update->model_id);
+    }
     if (update->device_class[0] != '\0') {
         copy_str(peer->device_class, sizeof(peer->device_class), update->device_class);
     }
@@ -504,6 +558,17 @@ static void merge_peer(const bos_peer_t *update)
     }
     if (update->service_version[0] != '\0') {
         copy_str(peer->service_version, sizeof(peer->service_version), update->service_version);
+    }
+    if (update->firmware_version[0] != '\0') {
+        copy_str(peer->firmware_version, sizeof(peer->firmware_version), update->firmware_version);
+    }
+    if (update->has_http_port) {
+        peer->http_port = update->http_port;
+        peer->has_http_port = true;
+    }
+    if (update->has_commissioned) {
+        peer->commissioned = update->commissioned;
+        peer->has_commissioned = true;
     }
     if (update->tmfs_catalog[0] != '\0') {
         copy_str(peer->tmfs_catalog, sizeof(peer->tmfs_catalog), update->tmfs_catalog);
@@ -796,8 +861,30 @@ static int append_peer_json(char **cursor,
         appendf(cursor, remaining, ",\"model\":") < 0 ||
         append_json_string(cursor, remaining, peer->model) < 0 ||
         appendf(cursor, remaining, ",\"model_id\":") < 0 ||
-        append_json_string(cursor, remaining, peer->model) < 0 ||
-        appendf(cursor, remaining, ",\"device_class\":") < 0 ||
+        append_json_string(cursor, remaining, peer->model_id[0] != '\0' ? peer->model_id : peer->model) < 0 ||
+        appendf(cursor, remaining, ",\"fw\":") < 0 ||
+        append_json_string(cursor, remaining, peer->firmware_version) < 0 ||
+        appendf(cursor, remaining, ",\"http\":") < 0) {
+        return -1;
+    }
+    if (peer->has_http_port) {
+        if (appendf(cursor, remaining, "%u", (unsigned)peer->http_port) < 0) {
+            return -1;
+        }
+    } else if (appendf(cursor, remaining, "null") < 0) {
+        return -1;
+    }
+    if (appendf(cursor, remaining, ",\"commissioned\":") < 0) {
+        return -1;
+    }
+    if (peer->has_commissioned) {
+        if (append_raw(cursor, remaining, peer->commissioned ? "true" : "false") < 0) {
+            return -1;
+        }
+    } else if (appendf(cursor, remaining, "null") < 0) {
+        return -1;
+    }
+    if (appendf(cursor, remaining, ",\"device_class\":") < 0 ||
         append_json_string(cursor, remaining, peer->device_class) < 0 ||
         appendf(cursor, remaining, ",\"thread_address\":") < 0 ||
         append_json_string(cursor, remaining, address) < 0 ||
@@ -1006,6 +1093,69 @@ int bos_convergence_aggregator_torrent_json(char *out, size_t out_len)
                      counts.stale,
                      counts.offline,
                      s_started ? "active" : "initialising") >= 0;
+    }
+    unlock_peers();
+
+    if (!ok) {
+        return -1;
+    }
+    return (int)(out_len - remaining);
+}
+
+int bos_convergence_aggregator_bootstrap_peers_json(char *out, size_t out_len, size_t max_peers)
+{
+    if (!out || out_len == 0) {
+        return -1;
+    }
+
+    bos_ledger_active_t active = {0};
+    bool active_ok = bos_ledger_ingress_get_active(&active) == ESP_OK && active.present;
+
+    char *cursor = out;
+    size_t remaining = out_len;
+    uint64_t now = now_ms();
+
+    if (!try_lock_peers(pdMS_TO_TICKS(50))) {
+        return -1;
+    }
+    bool ok = append_raw(&cursor, &remaining, "[") >= 0;
+    size_t emitted = 0;
+    for (size_t i = 0; ok && active_ok && i < s_peer_count && emitted < max_peers; i++) {
+        const bos_peer_t *peer = &s_peers[i];
+        uint64_t age = now > peer->last_seen_ms ? now - peer->last_seen_ms : 0;
+        if (age > BOS_AGG_STALE_TIMEOUT_MS ||
+            !peer->has_tmfs || !peer->has_address || peer->tmfs_port == 0U ||
+            !peer->has_chunks || peer->chunks_total == 0U ||
+            peer->chunks_have < peer->chunks_total ||
+            !peer_is_current(peer, &active)) {
+            continue;
+        }
+        char address[33];
+        ip6_to_plain_hex(peer->address, address);
+        if (emitted > 0U) {
+            ok = append_raw(&cursor, &remaining, ",") >= 0;
+        }
+        if (ok) {
+            ok = appendf(&cursor,
+                         &remaining,
+                         "{\"ledger_version\":%u,\"manifest_digest\":",
+                         (unsigned)peer->ledger_version) >= 0 &&
+                 append_json_string(&cursor, &remaining, peer->digest_hex) >= 0 &&
+                 appendf(&cursor,
+                         &remaining,
+                         ",\"chunks_have\":%u,\"chunks_total\":%u,\"address\":\"%s\","
+                         "\"service\":{\"tmfs\":true,\"port\":%u}}",
+                         (unsigned)peer->chunks_have,
+                         (unsigned)peer->chunks_total,
+                         address,
+                         (unsigned)peer->tmfs_port) >= 0;
+        }
+        if (ok) {
+            emitted++;
+        }
+    }
+    if (ok) {
+        ok = append_raw(&cursor, &remaining, "]") >= 0;
     }
     unlock_peers();
 

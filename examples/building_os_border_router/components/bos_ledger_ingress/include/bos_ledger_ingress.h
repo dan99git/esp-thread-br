@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define BOS_LEDGER_NVS_NAMESPACE  "bos_ledger"
-#define BOS_LEDGER_KEY_ACTIVE_PART "active_partition"
+#define BOS_LEDGER_KEY_ACTIVE_PART "active_part" /* NVS keys max 15 chars; "active_partition" (16) faulted every metadata commit */
 #define BOS_LEDGER_KEY_VERSION     "active_version"
 #define BOS_LEDGER_KEY_DIGEST      "active_digest"
 #define BOS_LEDGER_KEY_COMMITTED   "committed_at"
@@ -62,6 +62,10 @@ esp_err_t bos_ledger_ingress_init(void);
 
 // Current ledger lifecycle state.
 bos_ledger_state_t bos_ledger_ingress_state(void);
+
+// Renders the last ledger push failure as JSON.
+// Returns the snprintf-style byte count, or a negative value on formatting failure.
+int bos_ledger_ingress_last_error_json(char *out, size_t out_len);
 
 // Reads the currently active ledger metadata from NVS.
 // Returns ESP_ERR_NVS_NOT_FOUND if no ledger has been activated.

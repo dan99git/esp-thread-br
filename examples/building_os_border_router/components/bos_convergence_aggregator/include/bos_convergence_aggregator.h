@@ -40,9 +40,11 @@ typedef struct {
     char     tmfs_instance[64];
     char     host_name[96];
     char     model[48];
+    char     model_id[64];
     char     device_class[24];
     char     package_state[12];
     char     service_version[12];
+    char     firmware_version[32];
     char     tmfs_catalog[24];
     char     tmfs_caps[64];
     char     tmfs_wire_payload[12];
@@ -55,9 +57,13 @@ typedef struct {
     uint32_t chunks_total;
     uint16_t coap_port;
     uint16_t tmfs_port;
+    uint16_t http_port;
     bool     has_mesh;
     bool     has_tmfs;
     bool     has_address;
+    bool     has_http_port;
+    bool     has_commissioned;
+    bool     commissioned;
     bool     has_ledger_version;
     bool     has_digest;
     bool     has_chunks;
@@ -83,6 +89,13 @@ esp_err_t bos_convergence_aggregator_start(void);
 int bos_convergence_aggregator_snapshot_json(char *out, size_t out_len);
 int bos_convergence_aggregator_peers_json(char *out, size_t out_len);
 int bos_convergence_aggregator_torrent_json(char *out, size_t out_len);
+
+// Renders a compact JSON array of TMFS bootstrap peers for the mesh /mesh/have
+// response: fresh peers whose advertised ledger matches the BR active ledger
+// with complete chunks. Each row carries ledger_version, manifest_digest,
+// chunks_have, chunks_total, address (32 plain hex chars), and
+// service{tmfs,port}. Returns bytes written or -1.
+int bos_convergence_aggregator_bootstrap_peers_json(char *out, size_t out_len, size_t max_peers);
 
 #ifdef __cplusplus
 }

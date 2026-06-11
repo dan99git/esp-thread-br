@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "bos_convergence_aggregator.h"
 #include "bos_ledger_ingress.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -27,6 +28,7 @@ static const char *TAG = "bos_mesh_serve";
 #define BOS_LEDGER_COAP_PATH_MANIFEST "mesh/ledger/manifest"
 #define BOS_LEDGER_COAP_PATH_CHUNK    "mesh/ledger/chunk"
 #define BOS_LEDGER_COAP_PATH_HAVE     "mesh/have"
+#define BOS_LEDGER_HAVE_BOOTSTRAP_PEERS_MAX 2U
 #define BOS_LEDGER_BLOCK_SZX OT_COAP_OPTION_BLOCK_SZX_256
 #define BOS_MESH_SERVICE_NAME "_mesh._udp"
 #define BOS_MESH_SRP_TXT_ENTRY_COUNT 7U
@@ -445,9 +447,54 @@ static void handle_have(void *context, otMessage *message, const otMessageInfo *
         return;
     }
 
-    char json[768];
-    int len = bos_ledger_mesh_serve_torrent_json(json, sizeof(json));
-    if (len < 0) {
+    // Compact bootstrap response: target metadata plus up to
+    // BOS_LEDGER_HAVE_BOOTSTRAP_PEERS_MAX TMFS device peers so a stale device
+    // can fetch the ledger from a device instead of the BR. The full torrent
+    // JSON does not fit the Thread IPv6 MTU once peer rows exist.
+    char peers_json[640];
+    int peers_len = bos_convergence_aggregator_bootstrap_peers_json(peers_json,
+                                                                    sizeof(peers_json),
+                                                                    BOS_LEDGER_HAVE_BOOTSTRAP_PEERS_MAX);
+    if (peers_len < 0) {
+        ESP_LOGW(TAG, "bootstrap peer snapshot failed; /mesh/have responds without peers");
+        snprintf(peers_json, sizeof(peers_json), "[]");
+    }
+
+    bos_ledger_active_t active;
+    bool active_ok = bos_ledger_ingress_get_active(&active) == ESP_OK && active.present;
+
+    char json[1152];
+    int len;
+    if (active_ok) {
+        char digest[BOS_LEDGER_DIGEST_LEN * 2 + 1];
+        digest_hex(active.digest, digest);
+        len = snprintf(json,
+                       sizeof(json),
+                       "{\"artifact_class\":\"ledger\",\"have\":%u,\"chunk_count\":%u,"
+                       "\"target\":{\"ledger_version\":%u,\"manifest_digest\":\"%s\","
+                       "\"chunk_size\":%u,\"chunks_total\":%u,\"bytes_total\":%u},"
+                       "\"peers\":%s,\"source\":\"br-bootstrap\",\"state\":\"%s\"}",
+                       (unsigned)active.chunk_count,
+                       (unsigned)active.chunk_count,
+                       (unsigned)active.version,
+                       digest,
+                       (unsigned)active.chunk_size,
+                       (unsigned)active.chunk_count,
+                       (unsigned)active.size_bytes,
+                       peers_json,
+                       ledger_state_string(bos_ledger_ingress_state()));
+    } else {
+        len = snprintf(json,
+                       sizeof(json),
+                       "{\"artifact_class\":\"ledger\",\"have\":0,\"chunk_count\":0,"
+                       "\"target\":{\"ledger_version\":null,\"manifest_digest\":null,"
+                       "\"chunk_size\":%u,\"chunks_total\":0,\"bytes_total\":0},"
+                       "\"peers\":%s,\"source\":\"br-bootstrap\",\"state\":\"%s\"}",
+                       (unsigned)BOS_LEDGER_CHUNK_SIZE,
+                       peers_json,
+                       ledger_state_string(bos_ledger_ingress_state()));
+    }
+    if (len < 0 || len >= (int)sizeof(json)) {
         send_simple_error(message, message_info, OT_COAP_CODE_INTERNAL_ERROR);
         return;
     }

@@ -24,6 +24,9 @@ static const char *TAG = "bos_ingress";
 #define BOS_LEDGER_PARTITION_SUBTYPE 0x99
 #define BOS_LEDGER_PUSH_MAX_BYTES (64U * 1024U)
 #define BOS_LEDGER_HEADER_TOKEN_MAX 128
+#define BOS_LEDGER_ERROR_PHASE_MAX 32
+#define BOS_LEDGER_ERROR_MESSAGE_MAX 96
+#define BOS_LEDGER_ERROR_PARTITION_MAX 16
 
 typedef struct {
     const uint8_t *body;
@@ -33,6 +36,36 @@ typedef struct {
 } bos_ledger_body_view_t;
 
 static bos_ledger_state_t s_state = BOS_LEDGER_STATE_NONE;
+static bool s_last_error_present = false;
+static esp_err_t s_last_error_code = ESP_OK;
+static uint32_t s_last_error_size_bytes = 0;
+static char s_last_error_phase[BOS_LEDGER_ERROR_PHASE_MAX] = "";
+static char s_last_error_message[BOS_LEDGER_ERROR_MESSAGE_MAX] = "";
+static char s_last_error_partition[BOS_LEDGER_ERROR_PARTITION_MAX] = "";
+
+static void clear_last_error(void)
+{
+    s_last_error_present = false;
+    s_last_error_code = ESP_OK;
+    s_last_error_size_bytes = 0;
+    s_last_error_phase[0] = '\0';
+    s_last_error_message[0] = '\0';
+    s_last_error_partition[0] = '\0';
+}
+
+static void set_last_error(const char *phase,
+                           esp_err_t code,
+                           const char *message,
+                           uint32_t size_bytes,
+                           const char *partition)
+{
+    s_last_error_present = true;
+    s_last_error_code = code;
+    s_last_error_size_bytes = size_bytes;
+    snprintf(s_last_error_phase, sizeof(s_last_error_phase), "%s", phase ? phase : "unknown");
+    snprintf(s_last_error_message, sizeof(s_last_error_message), "%s", message ? message : "unknown");
+    snprintf(s_last_error_partition, sizeof(s_last_error_partition), "%s", partition ? partition : "");
+}
 
 static void digest_hex(const uint8_t digest[BOS_LEDGER_DIGEST_LEN], char out[BOS_LEDGER_DIGEST_LEN * 2 + 1])
 {
@@ -387,6 +420,26 @@ bos_ledger_state_t bos_ledger_ingress_state(void)
     return s_state;
 }
 
+int bos_ledger_ingress_last_error_json(char *out, size_t out_len)
+{
+    if (!out || out_len == 0) {
+        return -1;
+    }
+    if (!s_last_error_present) {
+        return snprintf(out, out_len, "{\"present\":false}");
+    }
+    return snprintf(out,
+                    out_len,
+                    "{\"present\":true,\"phase\":\"%s\",\"code\":%d,\"name\":\"%s\","
+                    "\"message\":\"%s\",\"size_bytes\":%u,\"partition\":\"%s\"}",
+                    s_last_error_phase,
+                    (int)s_last_error_code,
+                    esp_err_to_name(s_last_error_code),
+                    s_last_error_message,
+                    (unsigned)s_last_error_size_bytes,
+                    s_last_error_partition);
+}
+
 esp_err_t bos_ledger_ingress_get_active(bos_ledger_active_t *out)
 {
     if (!out) {
@@ -469,23 +522,34 @@ esp_err_t bos_ledger_ingress_read_active(size_t offset, uint8_t *out, size_t out
     return err;
 }
 
+/* Error paths must return ESP_OK once a response has been sent. A non-ESP_OK
+ * handler return makes esp_http_server close the socket immediately
+ * (httpd_uri.c: "Handler returns error, this socket should be closed") and
+ * skips the httpd_req_delete() purge of any unread POST body, so close() on
+ * the socket with unreceived data emits a TCP RST that destroys the in-flight
+ * response body (observed on hardware: 401 headers then connection reset).
+ * Return ESP_FAIL only when the socket itself is unusable. */
 esp_err_t bos_ledger_ingress_http_push(httpd_req_t *req)
 {
     if (!push_authorized(req)) {
+        set_last_error("auth", ESP_FAIL, "unauthorized ledger push", (uint32_t)req->content_len, "");
         httpd_resp_set_status(req, "401 Unauthorized");
         httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"unauthorized\"}");
-        return ESP_FAIL;
+        return ESP_OK;
     }
+    clear_last_error();
 
     if (req->content_len == 0 || req->content_len > BOS_LEDGER_PUSH_MAX_BYTES) {
+        set_last_error("body_size", ESP_ERR_INVALID_SIZE, "ledger body must be 1..65536 bytes", (uint32_t)req->content_len, "");
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ledger body must be 1..65536 bytes");
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     uint8_t *body = (uint8_t *)malloc(req->content_len);
     if (!body) {
+        set_last_error("receive", ESP_ERR_NO_MEM, "out of memory allocating ledger body", (uint32_t)req->content_len, "");
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     bos_ledger_state_t prior_state = s_state;
@@ -496,7 +560,9 @@ esp_err_t bos_ledger_ingress_http_push(httpd_req_t *req)
         if (ret <= 0) {
             free(body);
             s_state = prior_state;
+            set_last_error("receive", ESP_FAIL, "failed to receive ledger body", (uint32_t)req->content_len, "");
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "failed to receive ledger body");
+            /* Socket-level receive failure: connection is unusable, close it. */
             return ESP_FAIL;
         }
         received += (size_t)ret;
@@ -508,8 +574,9 @@ esp_err_t bos_ledger_ingress_http_push(httpd_req_t *req)
     if (err != ESP_OK) {
         free(body);
         s_state = prior_state;
+        set_last_error("validate", err, "ledger envelope digest validation failed", (uint32_t)req->content_len, "");
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ledger envelope digest validation failed");
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     uint8_t active_idx = 0;
@@ -521,8 +588,9 @@ esp_err_t bos_ledger_ingress_http_push(httpd_req_t *req)
     if (!target) {
         free(body);
         s_state = prior_state;
+        set_last_error("partition_lookup", ESP_ERR_NOT_FOUND, "inactive ledger partition missing", (uint32_t)req->content_len, target_idx == 0 ? BOS_LEDGER_PARTITION_A : BOS_LEDGER_PARTITION_B);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "inactive ledger partition missing");
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     s_state = BOS_LEDGER_STATE_COMMITTING;
@@ -532,14 +600,36 @@ esp_err_t bos_ledger_ingress_http_push(httpd_req_t *req)
                                      view.ledger_version,
                                      view.manifest_digest,
                                      (uint32_t)req->content_len);
+        if (err != ESP_OK) {
+            set_last_error("metadata_commit", err, "failed to commit active ledger metadata", (uint32_t)req->content_len, target->label);
+        }
+    } else {
+        set_last_error("partition_write", err, "failed to write staged ledger partition", (uint32_t)req->content_len, target->label);
     }
 
     if (err != ESP_OK) {
         free(body);
         s_state = prior_state;
         ESP_LOGW(TAG, "ledger push failed: %s", esp_err_to_name(err));
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ledger commit failed");
-        return ESP_FAIL;
+        char last_error_json[256];
+        char error_json[384];
+        int last_error_written = bos_ledger_ingress_last_error_json(last_error_json, sizeof(last_error_json));
+        if (last_error_written < 0 || last_error_written >= (int)sizeof(last_error_json)) {
+            snprintf(last_error_json, sizeof(last_error_json), "{\"present\":false}");
+        }
+        int written = snprintf(error_json,
+                               sizeof(error_json),
+                               "{\"ok\":false,\"error\":\"ledger_commit_failed\",\"last_error\":%s}",
+                               last_error_json);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        if (written < 0 || written >= (int)sizeof(error_json)) {
+            httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"ledger_commit_failed\",\"last_error\":{\"present\":false}}");
+        } else {
+            httpd_resp_sendstr(req, error_json);
+        }
+        return ESP_OK;
     }
 
     char digest[BOS_LEDGER_DIGEST_LEN * 2 + 1];

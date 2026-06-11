@@ -4,6 +4,7 @@ idf_component_register(
     INCLUDE_DIRS
         "include"
     REQUIRES
+        bos_convergence_aggregator
         bos_ledger_ingress
         esp_partition
         freertos

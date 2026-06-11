@@ -83,6 +83,24 @@ static void digest_hex(const uint8_t digest[BOS_LEDGER_DIGEST_LEN], char out[BOS
     out[BOS_LEDGER_DIGEST_LEN * 2] = '\0';
 }
 
+/* CONFIG_NEWLIB_NANO_FORMAT has no 64-bit printf support; %llu misaligns the
+ * variadic args (LoadProhibited panic, first hit when the active-ledger
+ * handler rendered committed_at). Format u64 manually instead. */
+static void u64_to_dec(uint64_t value, char out[21])
+{
+    char tmp[21];
+    size_t i = 0;
+    do {
+        tmp[i++] = (char)('0' + (value % 10ULL));
+        value /= 10ULL;
+    } while (value != 0 && i < sizeof(tmp) - 1);
+    size_t n = 0;
+    while (i > 0) {
+        out[n++] = tmp[--i];
+    }
+    out[n] = '\0';
+}
+
 static int json_string_or_null(char *out, size_t out_len, const char *value)
 {
     if (!value || value[0] == '\0') {
@@ -157,6 +175,9 @@ static void send_json(httpd_req_t *req, const char *json)
     httpd_resp_sendstr(req, json);
 }
 
+/* Error paths return ESP_OK after the error response is sent: a non-ESP_OK
+ * handler return makes esp_http_server close the socket immediately, which
+ * can reset the connection before the response body is delivered. */
 static esp_err_t send_generated_json(httpd_req_t *req,
                                      size_t buffer_len,
                                      int (*renderer)(char *out, size_t out_len),
@@ -165,14 +186,14 @@ static esp_err_t send_generated_json(httpd_req_t *req,
     char *json = (char *)malloc(buffer_len);
     if (!json) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     int written = renderer(json, buffer_len);
     if (written < 0) {
         free(json);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, error_message);
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     send_json(req, json);
@@ -184,29 +205,39 @@ static esp_err_t ledger_active_get_handler(httpd_req_t *req)
 {
     bos_ledger_active_t active;
     esp_err_t err = bos_ledger_ingress_get_active(&active);
-    char json[256];
+    char last_error_json[256];
+    char json[640];
+
+    if (bos_ledger_ingress_last_error_json(last_error_json, sizeof(last_error_json)) < 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ledger error snapshot too large");
+        return ESP_OK;
+    }
 
     if (err == ESP_OK && active.present) {
         char digest[BOS_LEDGER_DIGEST_LEN * 2 + 1];
+        char committed_str[21];
         digest_hex(active.digest, digest);
+        u64_to_dec(active.committed_at, committed_str);
         snprintf(json,
                  sizeof(json),
                  "{\"present\":true,\"ledger_version\":%u,\"manifest_digest\":\"%s\","
-                 "\"committed_at_ms\":%llu,\"state\":\"%s\",\"size_bytes\":%u,"
-                 "\"chunk_size\":%u,\"chunk_count\":%u}",
+                 "\"committed_at_ms\":%s,\"state\":\"%s\",\"size_bytes\":%u,"
+                 "\"chunk_size\":%u,\"chunk_count\":%u,\"last_error\":%s}",
                  (unsigned)active.version,
                  digest,
-                 (unsigned long long)active.committed_at,
+                 committed_str,
                  ledger_state_str(bos_ledger_ingress_state()),
                  (unsigned)active.size_bytes,
                  (unsigned)active.chunk_size,
-                 (unsigned)active.chunk_count);
+                 (unsigned)active.chunk_count,
+                 last_error_json);
     } else {
         snprintf(json,
                  sizeof(json),
                  "{\"present\":false,\"ledger_version\":null,\"manifest_digest\":null,"
-                 "\"committed_at_ms\":null,\"state\":\"%s\"}",
-                 ledger_state_str(bos_ledger_ingress_state()));
+                 "\"committed_at_ms\":null,\"state\":\"%s\",\"last_error\":%s}",
+                 ledger_state_str(bos_ledger_ingress_state()),
+                 last_error_json);
     }
 
     send_json(req, json);
@@ -248,14 +279,15 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         char device_id_json[390];
         char site_server_url_json[970];
         char firmware_version_json[96];
+        char ledger_error_json[256];
         char ota_json[1536];
-        char json[2304];
+        char json[2560];
     } status_json_buffers_t;
 
     status_json_buffers_t *buffers = (status_json_buffers_t *)calloc(1, sizeof(status_json_buffers_t));
     if (buffers == NULL) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     char device_id[64] = "";
@@ -273,10 +305,11 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     if (json_string_or_null(buffers->device_id_json, sizeof(buffers->device_id_json), device_id) < 0 ||
         json_string_or_null(buffers->site_server_url_json, sizeof(buffers->site_server_url_json), site_server_url) < 0 ||
         json_string_or_null(buffers->firmware_version_json, sizeof(buffers->firmware_version_json), firmware_version) < 0 ||
+        bos_ledger_ingress_last_error_json(buffers->ledger_error_json, sizeof(buffers->ledger_error_json)) < 0 ||
         bos_br_ota_status_json(buffers->ota_json, sizeof(buffers->ota_json)) < 0) {
         free(buffers);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status metadata too large");
-        return ESP_FAIL;
+        return ESP_OK;
     }
     int written = snprintf(buffers->json,
                            sizeof(buffers->json),
@@ -287,7 +320,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
                            "\"ipv4\":\"%s\",\"ipv6\":\"%s\"},"
                            "\"thread\":{\"role\":\"not_polled\",\"network_name\":\"\",\"rloc16\":\"0xffff\"},"
                            "\"rcp\":{\"target\":\"%s\",\"version\":\"not_polled\"},"
-                           "\"ledger\":{\"state\":\"%s\"},\"ota\":%s}",
+                           "\"ledger\":{\"state\":\"%s\",\"last_error\":%s},\"ota\":%s}",
                            buffers->firmware_version_json,
                            buffers->device_id_json,
                            buffers->site_server_url_json,
@@ -307,11 +340,12 @@ static esp_err_t status_get_handler(httpd_req_t *req)
                            "unknown",
 #endif
                            ledger_state_str(bos_ledger_ingress_state()),
+                           buffers->ledger_error_json,
                            buffers->ota_json);
     if (written < 0 || written >= (int)sizeof(buffers->json)) {
         free(buffers);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status snapshot too large");
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     send_json(req, buffers->json);
