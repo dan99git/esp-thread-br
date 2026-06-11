@@ -597,11 +597,15 @@ int bos_ledger_mesh_serve_torrent_json(char *out, size_t out_len)
     if (err == ESP_OK && active.present) {
         char digest[BOS_LEDGER_DIGEST_LEN * 2 + 1];
         digest_hex(active.digest, digest);
+        /* The BR is a peer holding a replaceable cache of the server's
+         * artifact, not the implicit sole authority: self carries
+         * source=cache plus the cache persist state. */
         int written = snprintf(out,
                                out_len,
                                "{\"target\":{\"ledger_version\":%u,\"manifest_digest\":\"%s\","
                                "\"chunk_size\":%u,\"chunks_total\":%u,\"bytes_total\":%u},"
-                               "\"self\":{\"id\":\"border-router\",\"role\":\"seed\",\"state\":\"seedable\","
+                               "\"self\":{\"id\":\"border-router\",\"role\":\"seed\",\"source\":\"cache\","
+                               "\"persist\":\"%s\",\"state\":\"seedable\","
                                "\"ledger_version\":%u,\"manifest_digest\":\"%s\",\"chunks_have\":%u,"
                                "\"chunks_total\":%u,\"progress_pct\":100,\"rate_bps\":0,\"eta_ms\":null,"
                                "\"last_seen_ms\":0,\"last_error\":null},"
@@ -615,6 +619,7 @@ int bos_ledger_mesh_serve_torrent_json(char *out, size_t out_len)
                                (unsigned)active.chunk_size,
                                (unsigned)active.chunk_count,
                                (unsigned)active.size_bytes,
+                               bos_ledger_ingress_persist_state_str(),
                                (unsigned)active.version,
                                digest,
                                (unsigned)active.chunk_count,
@@ -627,7 +632,8 @@ int bos_ledger_mesh_serve_torrent_json(char *out, size_t out_len)
                            out_len,
                            "{\"target\":{\"ledger_version\":null,\"manifest_digest\":null,"
                            "\"chunk_size\":%u,\"chunks_total\":0,\"bytes_total\":0},"
-                           "\"self\":{\"id\":\"border-router\",\"role\":\"seed\",\"state\":\"waiting\","
+                           "\"self\":{\"id\":\"border-router\",\"role\":\"seed\",\"source\":\"cache\","
+                           "\"persist\":\"%s\",\"state\":\"waiting\","
                            "\"ledger_version\":null,\"manifest_digest\":null,\"chunks_have\":0,"
                            "\"chunks_total\":0,\"progress_pct\":0,\"rate_bps\":0,\"eta_ms\":null,"
                            "\"last_seen_ms\":0,\"last_error\":null},"
@@ -635,8 +641,9 @@ int bos_ledger_mesh_serve_torrent_json(char *out, size_t out_len)
                            "\"counts\":{\"online\":1,\"seeders\":0,\"leechers\":0,\"current\":0,"
                            "\"stale\":0,\"offline\":0,\"failed\":0},"
                            "\"source\":\"br-ledger\",\"state\":\"%s\","
-                           "\"note\":\"No active ledger is committed on this BR\"}",
+                           "\"note\":\"No active ledger is held on this BR\"}",
                            (unsigned)BOS_LEDGER_CHUNK_SIZE,
+                           bos_ledger_ingress_persist_state_str(),
                            ledger_state_string(bos_ledger_ingress_state()));
     return (written < 0 || (size_t)written >= out_len) ? -1 : written;
 }
