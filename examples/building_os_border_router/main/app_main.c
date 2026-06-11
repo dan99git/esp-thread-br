@@ -15,11 +15,16 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_openthread.h"
+#include "esp_openthread_border_router.h"
+#include "esp_openthread_lock.h"
 #include "esp_openthread_netif_glue.h"
 #include "esp_spiffs.h"
 #include "esp_vfs_eventfd.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "mdns.h"
 #include "nvs_flash.h"
+#include "protocol_examples_common.h"
 #include "sdkconfig.h"
 
 #include "border_router_launch.h"
@@ -89,6 +94,35 @@ static void init_bos_components_log_only(void)
     log_bos_init_result("bos_convergence_aggregator_init", bos_convergence_aggregator_init());
 }
 
+#if !CONFIG_EXAMPLE_CONNECT_ETHERNET
+#error "The BOS BR backbone is the wired control LAN (docs/08.8-border-router.md section 11); enable CONFIG_EXAMPLE_CONNECT_ETHERNET."
+#endif
+
+/* BOS Thread bring-up. Replaces the upstream CONFIG_OPENTHREAD_BR_AUTO_START
+ * task (examples/common/thread_border_router ot_br_init), which is disabled
+ * in sdkconfig: the upstream path forms an anonymous random network outside
+ * the documented commissioning model. Here the dataset lifecycle is owned by
+ * bos_thread_dataset_anchor_apply_or_form() (apply persisted dataset, else
+ * form once and persist), per docs/06.2-commissioning-workflow.md phase 2b
+ * and docs/08.8-border-router.md section 11. Backbone connect and
+ * border-router init follow the upstream ot_br_init sequence. */
+static void bos_thread_bringup_task(void *ctx)
+{
+    (void)ctx;
+
+    /* Ethernet backbone (W5500); example_connect honors
+     * CONFIG_EXAMPLE_CONNECT_ETHERNET. */
+    ESP_ERROR_CHECK(example_connect());
+
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    esp_openthread_set_backbone_netif(get_example_netif());
+    ESP_ERROR_CHECK(esp_openthread_border_router_init());
+    ESP_ERROR_CHECK(bos_thread_dataset_anchor_apply_or_form());
+    esp_openthread_lock_release();
+
+    vTaskDelete(NULL);
+}
+
 void app_main(void)
 {
     size_t max_eventfd = 3;
@@ -134,6 +168,13 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Building OS Border Router init complete; launching upstream OpenThread BR");
     launch_openthread_border_router(&openthread_config, &rcp_update_config);
+
+    /* Same task shape as the upstream auto-start path (xTaskCreate of the
+     * bring-up after launch); the task body is BOS-owned, see above. */
+    if (xTaskCreate(bos_thread_bringup_task, "bos_thread_up", 6144, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "failed to create Thread bring-up task; mesh will not form");
+    }
+
     log_bos_init_result("bos_ledger_mesh_serve_init", bos_ledger_mesh_serve_init());
     log_bos_init_result("bos_convergence_aggregator_start", bos_convergence_aggregator_start());
 }

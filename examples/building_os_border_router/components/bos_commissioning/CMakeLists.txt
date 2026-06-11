@@ -1,0 +1,14 @@
+idf_component_register(
+    SRCS
+        "bos_commissioning.c"
+        "bos_joiner.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        bos_server_registration
+        esp_http_server
+        esp_timer
+        json
+        nvs_flash
+        openthread
+)

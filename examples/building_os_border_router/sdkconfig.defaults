@@ -46,7 +46,15 @@ CONFIG_OPENTHREAD_SRP_CLIENT=y
 CONFIG_OPENTHREAD_SRP_CLIENT_MAX_SERVICES=5
 CONFIG_OPENTHREAD_NUM_MESSAGE_BUFFERS=128
 CONFIG_OPENTHREAD_RCP_COMMAND=y
-CONFIG_OPENTHREAD_BR_AUTO_START=y
+# Upstream auto-start (random network formed by examples/common ot_br_init)
+# is replaced by the BOS bring-up task in main/app_main.c, which owns
+# backbone connect, BR init, and the bos_thread_dataset_anchor dataset
+# lifecycle (apply persisted dataset, else form once and persist).
+CONFIG_OPENTHREAD_BR_AUTO_START=n
+# OpenThread Commissioner role for docs/06.2 phase 2b joiner acceptance
+# (POST /bos/joiner/accept). Already =y in sdkconfig; pinned here so
+# regenerated configs keep it.
+CONFIG_OPENTHREAD_COMMISSIONER=y
 CONFIG_OPENTHREAD_BR_START_WEB=y
 CONFIG_ESP_BR_WEB_WRITE_AUTH=y
 CONFIG_ESP_BR_WEB_ADMIN_PASSWORD=""
