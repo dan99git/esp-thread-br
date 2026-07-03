@@ -4,7 +4,6 @@ idf_component_register(
     INCLUDE_DIRS
         "include"
     REQUIRES
-        bos_floating_book
         bos_ledger_ingress
         esp_timer
         freertos

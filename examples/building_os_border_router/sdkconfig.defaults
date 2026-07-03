@@ -24,11 +24,17 @@ CONFIG_LIBC_NEWLIB_NANO_FORMAT=y
 CONFIG_FREERTOS_HZ=1000
 CONFIG_NVS_ENCRYPTION=n
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+# 24K: bos_diagnostics phonebook load nests two ~5KB bos_phonebook_t on the main task at boot; 6144 overflowed -> TCB corruption -> ISR notify assert (2026-06-15)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3584
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_APP_PROJECT_VER_FROM_CONFIG=y
-CONFIG_APP_PROJECT_VER="0.1.2"
+# 0.1.18: BR phonebook ingest + /bos/trigger phonebook ML-EID resolver (2026-06-14)
+# 0.1.19: phonebook v2 acceptance + floating book + bos_time + mDNS gateway discovery + EUI-64 device_id (2026-07-02)
+# 0.1.20: confirm-gated POST /bos/device-id/reset - erases the NVS bos_reg/device_id override so boot re-derives the EUI-64 id (2026-07-02)
+# 0.1.21: device-id reset also erases bos_reg/device_token so the BR re-claims under the new id (0.1.20 kept the old token: no re-claim, heartbeats 404) (2026-07-02)
+# 0.1.22: phonebook v3 (17-col, model_id + rated_power_w/rated_lumens/cct), floating book parses SRP rpw/rl/cct + reports them to convergence, operational book v3-only (v2/v1 reject), new GET /bos/<spatial_id>/* reverse proxy (2026-07-04)
+CONFIG_APP_PROJECT_VER="0.1.22"
 
 # HTTP server for upstream BR diagnostics and Building OS /bos/ endpoints.
 CONFIG_HTTPD_WS_SUPPORT=y
@@ -103,7 +109,9 @@ CONFIG_EXAMPLE_ETH_SPI_SCLK_GPIO=21
 CONFIG_EXAMPLE_ETH_SPI_MOSI_GPIO=45
 CONFIG_EXAMPLE_ETH_SPI_MISO_GPIO=38
 CONFIG_EXAMPLE_ETH_SPI_CS_GPIO=41
-CONFIG_EXAMPLE_ETH_SPI_CLOCK_MHZ=36
+# Diagnostic margin (br-diagnosis.md finding #3): 36 MHz is known-issue
+# territory for W5500+OTBR; run the stability test at 20 MHz.
+CONFIG_EXAMPLE_ETH_SPI_CLOCK_MHZ=20
 CONFIG_EXAMPLE_ETH_SPI_INT_GPIO=39
 CONFIG_EXAMPLE_ETH_PHY_RST_GPIO=40
 CONFIG_EXAMPLE_ETH_PHY_ADDR=1

@@ -41,6 +41,8 @@ typedef struct {
     char     host_name[96];
     char     model[48];
     char     model_id[64];
+    char     sku[24];
+    char     rated_power_w[16];
     char     device_class[24];
     char     package_state[12];
     char     service_version[12];
@@ -55,6 +57,8 @@ typedef struct {
     uint32_t ledger_version;
     uint32_t chunks_have;
     uint32_t chunks_total;
+    int      rated_lumens;
+    int      cct;
     uint16_t coap_port;
     uint16_t tmfs_port;
     uint16_t http_port;
@@ -67,6 +71,8 @@ typedef struct {
     bool     has_ledger_version;
     bool     has_digest;
     bool     has_chunks;
+    bool     has_rated_lumens;
+    bool     has_cct;
     bos_peer_state_t state;
     uint64_t last_seen_ms;
 } bos_peer_t;

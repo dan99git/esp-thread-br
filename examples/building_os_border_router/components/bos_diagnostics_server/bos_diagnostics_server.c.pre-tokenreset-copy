@@ -75,16 +75,16 @@ static char s_backbone_if[24] = "unknown";
 #define BOS_PHONEBOOK_DEVICE_CLASS_MAX 48
 #define BOS_PHONEBOOK_TAGS_MAX 160
 #define BOS_PHONEBOOK_COORD_MAX 32
-/* v3 operational book (phonebook v3, 17 columns, exact order). This is the
- * ONLY accepted format: a v2 (14-col) or v1 (9-col) document hard-rejects at
- * the magic line and again at the column-header cross-check - no silent
- * fallback. v3 rows carry make/model/model_id/photometry in the stored raw
- * document; only eui64/device_class/spatial_id/tags/x/y/z/eid are parsed into
- * the resolve + spatial-proxy table. The gateway still mints the version
- * (BR-owned version authority remains a follow-up). */
-#define BOS_PHONEBOOK_COLUMNS_V3 \
-    "eui64,device_id,device_class,make,model,model_id,sku,fw,rated_power_w,rated_lumens,cct,discovered_at,eid,x,y,z,spatial_id,tags"
-#define BOS_PHONEBOOK_FIELDS_MAX 18
+#define BOS_PHONEBOOK_COLUMNS "eui64,device_id,spatial_id,device_class,tags,x,y,z,eid"
+/* v2 operational book (docs/scratch/phonebook-v2-two-book-spec.md section 1):
+ * 14 columns, exact order. The receiver accepts BOTH formats; v2 rows map
+ * onto the existing row struct (make/model/fw/rated_current/discovered_at
+ * are carried in the stored raw document, not parsed into the resolve
+ * table). Version handling is unchanged: the gateway still mints the
+ * version (BR-owned version authority is a follow-up, spec section 2.2). */
+#define BOS_PHONEBOOK_COLUMNS_V2 \
+    "eui64,device_id,device_class,make,model,fw,rated_current,discovered_at,eid,x,y,z,spatial_id,tags"
+#define BOS_PHONEBOOK_FIELDS_MAX 14
 
 typedef struct {
     char eui64[17];
@@ -101,7 +101,7 @@ typedef struct {
 
 typedef struct {
     bool loaded;
-    int columns_version; /* 3 = 17-col v3 (only accepted format) */
+    int columns_version; /* 1 = 9-col v1, 2 = 14-col v2 */
     char version[BOS_PHONEBOOK_VERSION_MAX];
     char digest[BOS_PHONEBOOK_DIGEST_MAX];
     char generated_at[BOS_PHONEBOOK_GENERATED_AT_MAX];
@@ -933,25 +933,21 @@ static esp_err_t thread_reset_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* POST /bos/device-id/reset: confirm-gated identity reset. Erases the NVS
- * bos_reg/device_id override AND bos_reg/device_token so the next boot
- * re-derives the EUI-64 device id (bos_server_registration.c load_device_id:
- * ESP_MAC_IEEE802154, else base MAC with ff:fe inserted), persists it, and
- * re-claims with the site server under the new id. Shipped to flip the
- * legacy colon-MAC identity ("9c:13:9e:0a:47:47") to the durable EUI-64
- * without reflashing: the override wins over derivation, so OTA alone cannot
- * fix it. The token erase is load-bearing (0.1.21 fix, live defect on the
- * 0.1.20 bench run 2026-07-02): with the old token kept, is_registered()
- * stays true, the registration task never re-claims, the gateway never
- * learns the new id, and every heartbeat 404s into the RAM buffer.
- * Token-authed write, same trust anchor as /bos/ota/app (X-Device-Token /
- * api key via bos_commissioning_request_authorized). Refusal shape mirrors
- * the C6 install-retrigger 428 plan (firmware/xiao-esp32c6/main/
- * web_routes_card.c handle_api_install_retrigger): {"confirm": true}
- * required in the JSON body; without it the route returns the exact plan and
- * takes no action. On accept the 200 response is sent FIRST, then the
- * two-key erase runs and the BR restarts after a flush delay. A failed erase
- * logs ESP_LOGE and does NOT restart. */
+/* POST /bos/device-id/reset: confirm-gated identity reset. Erases ONLY the
+ * NVS bos_reg/device_id override so the next boot re-derives the EUI-64
+ * device id (bos_server_registration.c load_device_id: ESP_MAC_IEEE802154,
+ * else base MAC with ff:fe inserted), persists it, and re-registers with the
+ * site server. Shipped to flip the legacy colon-MAC identity
+ * ("9c:13:9e:0a:47:47") to the durable EUI-64 without reflashing: the
+ * override wins over derivation, so OTA alone cannot fix it. Token-authed
+ * write, same trust anchor as /bos/ota/app (X-Device-Token / api key via
+ * bos_commissioning_request_authorized). Refusal shape mirrors the C6
+ * install-retrigger 428 plan (firmware/xiao-esp32c6/main/web_routes_card.c
+ * handle_api_install_retrigger): {"confirm": true} required in the JSON
+ * body; without it the route returns the exact plan and takes no action.
+ * On accept the 200 response is sent FIRST, then the single-key erase runs
+ * and the BR restarts after a flush delay. A failed erase logs ESP_LOGE and
+ * does NOT restart. */
 static esp_err_t device_id_reset_post_handler(httpd_req_t *req)
 {
     if (!bos_commissioning_request_authorized(req)) {
@@ -986,21 +982,18 @@ static esp_err_t device_id_reset_post_handler(httpd_req_t *req)
         cJSON_AddStringToObject(resp, "required_confirmation", "{\"confirm\": true}");
         cJSON *plan = cJSON_CreateObject();
         cJSON_AddStringToObject(plan, "nvs_namespace", BOS_REG_NVS_NAMESPACE);
-        cJSON *keys = cJSON_CreateArray();
-        cJSON_AddItemToArray(keys, cJSON_CreateString(BOS_REG_KEY_DEVICE_ID));
-        cJSON_AddItemToArray(keys, cJSON_CreateString(BOS_REG_KEY_TOKEN));
-        cJSON_AddItemToObject(plan, "nvs_keys", keys);
+        cJSON_AddStringToObject(plan, "nvs_key", BOS_REG_KEY_DEVICE_ID);
         cJSON_AddStringToObject(plan, "current_device_id", current_id);
         cJSON *effect = cJSON_CreateArray();
         cJSON_AddItemToArray(effect, cJSON_CreateString(
-            "NVS keys bos_reg/device_id and bos_reg/device_token erased (server_url and all other keys untouched)"));
+            "NVS key bos_reg/device_id erased (single key; device_token, server_url, and all other keys untouched)"));
         cJSON_AddItemToArray(effect, cJSON_CreateString(
             "the BR restarts right after the erase"));
         cJSON_AddItemToArray(effect, cJSON_CreateString(
-            "on boot the device id is re-derived as EUI-64 (ESP_MAC_IEEE802154, else base MAC with ff:fe inserted), persisted to NVS, and the BR re-claims with the site server under the new id for a fresh token"));
+            "on boot the device id is re-derived as EUI-64 (ESP_MAC_IEEE802154, else base MAC with ff:fe inserted), persisted to NVS, and used to re-register with the site server"));
         cJSON_AddItemToObject(plan, "effect", effect);
         cJSON_AddStringToObject(plan, "why",
-            "The NVS device_id override wins over EUI-64 derivation (load_device_id override-first), so the legacy colon-MAC id survives every OTA; the old token must also go or is_registered() stays true and the BR never re-claims, leaving the gateway on the old id and heartbeats failing.");
+            "The NVS device_id override wins over EUI-64 derivation (load_device_id override-first), so the legacy colon-MAC id survives every OTA; erasing the override is the only way to flip identity without reflashing.");
         cJSON_AddItemToObject(resp, "plan", plan);
         httpd_resp_set_status(req, "428 Precondition Required");
         esp_err_t ret = send_cjson(req, resp);
@@ -1029,17 +1022,8 @@ static esp_err_t device_id_reset_post_handler(httpd_req_t *req)
         err = nvs_erase_key(nvs, BOS_REG_KEY_DEVICE_ID);
         if (err == ESP_ERR_NVS_NOT_FOUND) {
             /* No override stored: nothing to erase, boot derivation already
-             * rules. Proceed to the token erase. */
+             * rules. Proceed to restart so the derived id registers. */
             err = ESP_OK;
-        }
-        if (err == ESP_OK) {
-            /* Token erase is load-bearing: with the old token kept,
-             * is_registered() stays true and the BR never re-claims under
-             * the re-derived id (0.1.20 live defect, 2026-07-02). */
-            err = nvs_erase_key(nvs, BOS_REG_KEY_TOKEN);
-            if (err == ESP_ERR_NVS_NOT_FOUND) {
-                err = ESP_OK;
-            }
         }
         if (err == ESP_OK) {
             err = nvs_commit(nvs);
@@ -1050,12 +1034,12 @@ static esp_err_t device_id_reset_post_handler(httpd_req_t *req)
         /* Loud failure, no restart: rebooting after a failed erase would just
          * re-register the legacy id and mask the fault. The 200 response is
          * already sent, so the log is the only remaining reporting channel. */
-        ESP_LOGE(TAG, "device-id reset: NVS erase of %s/%s+%s FAILED (%s); NOT restarting",
-                 BOS_REG_NVS_NAMESPACE, BOS_REG_KEY_DEVICE_ID, BOS_REG_KEY_TOKEN, esp_err_to_name(err));
+        ESP_LOGE(TAG, "device-id reset: NVS erase of %s/%s FAILED (%s); NOT restarting",
+                 BOS_REG_NVS_NAMESPACE, BOS_REG_KEY_DEVICE_ID, esp_err_to_name(err));
         return ret;
     }
-    ESP_LOGI(TAG, "device-id reset: NVS %s/%s and %s erased (old id \"%s\"); restarting to re-derive EUI-64 and re-claim",
-             BOS_REG_NVS_NAMESPACE, BOS_REG_KEY_DEVICE_ID, BOS_REG_KEY_TOKEN, current_id);
+    ESP_LOGI(TAG, "device-id reset: NVS %s/%s erased (old id \"%s\"); restarting to re-derive EUI-64",
+             BOS_REG_NVS_NAMESPACE, BOS_REG_KEY_DEVICE_ID, current_id);
     vTaskDelay(pdMS_TO_TICKS(250));
     esp_restart();
     return ret; /* not reached */
@@ -1460,22 +1444,32 @@ static esp_err_t phonebook_parse_comment_header(const char *line,
     char digest[BOS_PHONEBOOK_DIGEST_MAX] = "";
     char generated_at[BOS_PHONEBOOK_GENERATED_AT_MAX] = "";
     char extra = '\0';
-    /* v3 magic only ("bos-phonebook-v3", 17-col docs). A v2 ("bos-phonebook-v2")
-     * or v1 ("bos-phonebook") magic fails this literal sscanf and is rejected
-     * here with NO fallback. The version seen is recorded in
-     * book->columns_version and cross-checked against the column-header line by
-     * the caller. */
+    /* v2 magic first ("bos-phonebook-v2", 14-col docs), then v1
+     * ("bos-phonebook", 9-col docs). The magics are mutually exclusive under
+     * sscanf literal matching. The magic seen here is recorded in
+     * book->columns_version and enforced against the column header line by
+     * the caller - no cross-version fallback. */
     int matched = sscanf(line,
-                         "# bos-phonebook-v3 version=%23s digest=%95s generated_at=%47s %c",
+                         "# bos-phonebook-v2 version=%23s digest=%95s generated_at=%47s %c",
                          version,
                          digest,
                          generated_at,
                          &extra);
-    if (matched != 3) {
-        snprintf(error, error_len, "phonebook: missing or invalid comment header");
-        return ESP_ERR_INVALID_ARG;
+    if (matched == 3) {
+        book->columns_version = 2;
+    } else {
+        matched = sscanf(line,
+                         "# bos-phonebook version=%23s digest=%95s generated_at=%47s %c",
+                         version,
+                         digest,
+                         generated_at,
+                         &extra);
+        if (matched != 3) {
+            snprintf(error, error_len, "phonebook: missing or invalid comment header");
+            return ESP_ERR_INVALID_ARG;
+        }
+        book->columns_version = 1;
     }
-    book->columns_version = 3;
     if (!phonebook_is_ascii_digit_string(version)) {
         snprintf(error, error_len, "phonebook: invalid version");
         return ESP_ERR_INVALID_ARG;
@@ -1496,14 +1490,14 @@ static esp_err_t phonebook_parse_comment_header(const char *line,
 
 static esp_err_t phonebook_parse_row(char **fields, int count, bos_phonebook_t *book)
 {
-    /* v3: eui64,device_id,device_class,make,model,model_id,sku,fw,
-     *     rated_power_w,rated_lumens,cct,discovered_at,eid,x,y,z,spatial_id,
-     *     tags (18 cols). Keys on eui64 and requires a parseable eid for the
-     *     BR resolve + spatial-proxy table. make/model/model_id/sku/photometry
-     *     pass through in the stored raw document; not needed by the resolve
-     *     table. */
-    const int eid_idx = 12; /* eid is column 13 in v3 */
-    if (count != 18 || book->row_count >= BOS_PHONEBOOK_MAX_ROWS ||
+    /* v1: eui64,device_id,spatial_id,device_class,tags,x,y,z,eid (9 cols).
+     * v2: eui64,device_id,device_class,make,model,fw,rated_current,
+     *     discovered_at,eid,x,y,z,spatial_id,tags (14 cols).
+     * Both formats key on eui64 and require a parseable eid for the BR
+     * trigger-path resolve table. */
+    int expected = book->columns_version == 2 ? 14 : 9;
+    const int eid_idx = 8; /* eid is column 9 in BOTH formats */
+    if (count != expected || book->row_count >= BOS_PHONEBOOK_MAX_ROWS ||
         fields[0][0] == '\0' || fields[eid_idx][0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
@@ -1517,12 +1511,21 @@ static esp_err_t phonebook_parse_row(char **fields, int count, bos_phonebook_t *
     }
     ESP_RETURN_ON_ERROR(phonebook_copy_field(row.device_id, sizeof(row.device_id), fields[1]), TAG, "device_id too long");
     ESP_RETURN_ON_ERROR(phonebook_copy_field(row.eid, sizeof(row.eid), fields[eid_idx]), TAG, "eid too long");
-    ESP_RETURN_ON_ERROR(phonebook_copy_field(row.device_class, sizeof(row.device_class), fields[2]), TAG, "device_class too long");
-    ESP_RETURN_ON_ERROR(phonebook_copy_field(row.x, sizeof(row.x), fields[13]), TAG, "x too long");
-    ESP_RETURN_ON_ERROR(phonebook_copy_field(row.y, sizeof(row.y), fields[14]), TAG, "y too long");
-    ESP_RETURN_ON_ERROR(phonebook_copy_field(row.z, sizeof(row.z), fields[15]), TAG, "z too long");
-    ESP_RETURN_ON_ERROR(phonebook_copy_field(row.spatial_id, sizeof(row.spatial_id), fields[16]), TAG, "spatial_id too long");
-    ESP_RETURN_ON_ERROR(phonebook_copy_field(row.tags, sizeof(row.tags), fields[17]), TAG, "tags too long");
+    if (book->columns_version == 2) {
+        ESP_RETURN_ON_ERROR(phonebook_copy_field(row.device_class, sizeof(row.device_class), fields[2]), TAG, "device_class too long");
+        ESP_RETURN_ON_ERROR(phonebook_copy_field(row.x, sizeof(row.x), fields[9]), TAG, "x too long");
+        ESP_RETURN_ON_ERROR(phonebook_copy_field(row.y, sizeof(row.y), fields[10]), TAG, "y too long");
+        ESP_RETURN_ON_ERROR(phonebook_copy_field(row.z, sizeof(row.z), fields[11]), TAG, "z too long");
+        ESP_RETURN_ON_ERROR(phonebook_copy_field(row.spatial_id, sizeof(row.spatial_id), fields[12]), TAG, "spatial_id too long");
+        ESP_RETURN_ON_ERROR(phonebook_copy_field(row.tags, sizeof(row.tags), fields[13]), TAG, "tags too long");
+    } else {
+        ESP_RETURN_ON_ERROR(phonebook_copy_field(row.spatial_id, sizeof(row.spatial_id), fields[2]), TAG, "spatial_id too long");
+        ESP_RETURN_ON_ERROR(phonebook_copy_field(row.device_class, sizeof(row.device_class), fields[3]), TAG, "device_class too long");
+        ESP_RETURN_ON_ERROR(phonebook_copy_field(row.tags, sizeof(row.tags), fields[4]), TAG, "tags too long");
+        ESP_RETURN_ON_ERROR(phonebook_copy_field(row.x, sizeof(row.x), fields[5]), TAG, "x too long");
+        ESP_RETURN_ON_ERROR(phonebook_copy_field(row.y, sizeof(row.y), fields[6]), TAG, "y too long");
+        ESP_RETURN_ON_ERROR(phonebook_copy_field(row.z, sizeof(row.z), fields[7]), TAG, "z too long");
+    }
 
     book->rows[book->row_count++] = row;
     return ESP_OK;
@@ -1626,21 +1629,24 @@ static esp_err_t phonebook_parse_csv(const char *raw,
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* v3 only: the column header must be the exact 17-col v3 literal. A v2
-     * (14-col) or v1 (9-col) header fails this and is rejected here - the
-     * second, independent rejection point after the magic line. */
-    size_t columns_len = strlen(BOS_PHONEBOOK_COLUMNS_V3);
+    /* v2 first (its header is longer and not a prefix of v1), then v1. */
+    size_t columns_len = strlen(BOS_PHONEBOOK_COLUMNS_V2);
     int columns_version = 0;
-    if (strncmp(hash_body, BOS_PHONEBOOK_COLUMNS_V3, columns_len) == 0 && hash_body[columns_len] == '\n') {
-        columns_version = 3;
+    if (strncmp(hash_body, BOS_PHONEBOOK_COLUMNS_V2, columns_len) == 0 && hash_body[columns_len] == '\n') {
+        columns_version = 2;
     } else {
-        snprintf(error, error_len, "phonebook: column header mismatch");
-        free(hash_body);
-        free(book);
-        return ESP_ERR_INVALID_ARG;
+        columns_len = strlen(BOS_PHONEBOOK_COLUMNS);
+        if (strncmp(hash_body, BOS_PHONEBOOK_COLUMNS, columns_len) == 0 && hash_body[columns_len] == '\n') {
+            columns_version = 1;
+        } else {
+            snprintf(error, error_len, "phonebook: column header mismatch");
+            free(hash_body);
+            free(book);
+            return ESP_ERR_INVALID_ARG;
+        }
     }
     /* The magic recorded from line 1 must agree with the column header:
-     * v3 magic requires the 17-col line. */
+     * v2 magic requires the 14-col line, v1 magic the 9-col line. */
     if (columns_version != book->columns_version) {
         snprintf(error, error_len, "phonebook: magic/column header version mismatch");
         free(hash_body);
@@ -2141,12 +2147,6 @@ static const char *http_status_reason(int status)
     }
 }
 
-/* Shared mesh-forward machinery (defined below): resolves eui64 -> routable
- * mesh address via the BR's own SRP table, forwards over the mesh with
- * esp_http_client, streams the device response back. Used by BOTH the eui64
- * proxy (/bos/device/<eui64>/) and the spatial-id proxy (/bos/<spatial_id>/). */
-static esp_err_t proxy_forward_to_device(httpd_req_t *req, const char *eui64, const char *device_path);
-
 static esp_err_t device_proxy_handler(httpd_req_t *req)
 {
     /* GET is open-on-LAN; PUT/POST reach the device control surface and are
@@ -2170,11 +2170,6 @@ static esp_err_t device_proxy_handler(httpd_req_t *req)
     }
     const char *device_path = (eui_end && eui_end[0] != '\0') ? eui_end : "/";
 
-    return proxy_forward_to_device(req, eui64, device_path);
-}
-
-static esp_err_t proxy_forward_to_device(httpd_req_t *req, const char *eui64, const char *device_path)
-{
     /* Request body (PUT/POST), preserved verbatim. */
     char *body = NULL;
     int body_len = 0;
@@ -2302,74 +2297,6 @@ static esp_err_t proxy_forward_to_device(httpd_req_t *req, const char *eui64, co
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     return ESP_OK;
-}
-
-/* ------------------------------------------------------------------------
- * GET /bos/<spatial_id>/<path...>: the position-keyed sibling of the eui64
- * device proxy. Resolves spatial_id -> eui64 from the BR's OWN operational
- * phonebook (gateway-independent at request time), then reuses the exact same
- * mesh-forward machinery as /bos/device/<eui64>/. PAIRED devices only: a
- * spatial_id exists only on an operational row (published by the gateway on
- * pairing). Unknown spatial_id -> 404; floating rows have no spatial_id so
- * they are never reachable here. The operational book must be CURRENT for this
- * to resolve - the gateway's author-and-publish-on-pairing step is the
- * load-bearing prerequisite.
- * ------------------------------------------------------------------------ */
-
-/* Scan the operational phonebook for a row whose spatial_id matches; copies its
- * eui64 into out_eui64 (17 bytes). Returns true on a paired match. */
-static bool phonebook_resolve_spatial_to_eui64(const char *spatial_id, char out_eui64[17])
-{
-    if (!spatial_id || spatial_id[0] == '\0' || !out_eui64 || !s_phonebook_lock) {
-        return false;
-    }
-    bool found = false;
-    if (xSemaphoreTake(s_phonebook_lock, pdMS_TO_TICKS(200)) != pdTRUE) {
-        ESP_LOGW(TAG, "spatial resolve %s: phonebook lock timeout", spatial_id);
-        return false;
-    }
-    if (s_phonebook.loaded) {
-        for (size_t i = 0; i < s_phonebook.row_count; i++) {
-            if (s_phonebook.rows[i].spatial_id[0] != '\0' &&
-                strcmp(s_phonebook.rows[i].spatial_id, spatial_id) == 0) {
-                memcpy(out_eui64, s_phonebook.rows[i].eui64, sizeof(s_phonebook.rows[i].eui64));
-                found = true;
-                break;
-            }
-        }
-    }
-    xSemaphoreGive(s_phonebook_lock);
-    return found;
-}
-
-static esp_err_t spatial_proxy_handler(httpd_req_t *req)
-{
-    /* Registered as a GET-only catch-all under /bos/ (after all specific /bos
-     * routes), so it only ever sees GET here: open-on-LAN, same as the eui64
-     * proxy GET. */
-    const char *prefix = "/bos/";
-    const size_t prefix_len = strlen(prefix);
-    if (strncmp(req->uri, prefix, prefix_len) != 0) {
-        return send_status_json(req, "400 Bad Request", "malformed spatial proxy uri");
-    }
-    const char *sid_start = req->uri + prefix_len;
-    const char *sid_end = strchr(sid_start, '/');
-    size_t sid_len = sid_end ? (size_t)(sid_end - sid_start) : strlen(sid_start);
-    if (sid_len == 0U || sid_len >= BOS_PHONEBOOK_SPATIAL_ID_MAX) {
-        return send_status_json(req, "404 Not Found", "unknown spatial_id");
-    }
-    char spatial_id[BOS_PHONEBOOK_SPATIAL_ID_MAX];
-    memcpy(spatial_id, sid_start, sid_len);
-    spatial_id[sid_len] = '\0';
-
-    char eui64[17];
-    if (!phonebook_resolve_spatial_to_eui64(spatial_id, eui64)) {
-        return send_status_json(req, "404 Not Found", "spatial_id not in operational phonebook");
-    }
-
-    const char *device_path = (sid_end && sid_end[0] != '\0') ? sid_end : "/";
-    ESP_LOGI(TAG, "spatial proxy: spatial_id=%s -> eui64=%s path=%s", spatial_id, eui64, device_path);
-    return proxy_forward_to_device(req, eui64, device_path);
 }
 
 /* ------------------------------------------------------------------------
@@ -2929,9 +2856,8 @@ esp_err_t bos_diagnostics_server_start(void)
         .handler = device_proxy_handler,
         .user_ctx = NULL,
     };
-    /* Token-authed BR phonebook ingest: versioned v3 (18-col) CSV, header
-     * eui64,device_id,device_class,make,model,model_id,sku,fw,rated_power_w,
-     * rated_lumens,cct,discovered_at,eid,x,y,z,spatial_id,tags. */
+    /* Token-authed BR phonebook ingest: versioned CSV with
+     * eui64,device_id,spatial_id,device_class,tags,x,y,z,eid rows. */
     httpd_uri_t phonebook_post_uri = {
         .uri = "/bos/phonebook",
         .method = HTTP_POST,
@@ -2954,17 +2880,6 @@ esp_err_t bos_diagnostics_server_start(void)
         .handler = trigger_post_handler,
         .user_ctx = NULL,
     };
-    /* Position-keyed device proxy: GET /bos/<spatial_id>/<path...>. Wildcard
-     * "/bos/" catch-all, registered LAST so every specific /bos route above
-     * (status, ledger, device proxy, phonebook, trigger, ...) matches first;
-     * only an unclaimed /bos/<segment>/ falls through here to the spatial
-     * resolve. GET only. */
-    httpd_uri_t spatial_proxy_get_uri = {
-        .uri = "/bos/*",
-        .method = HTTP_GET,
-        .handler = spatial_proxy_handler,
-        .user_ctx = NULL,
-    };
 
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&status_uri), TAG, "failed to register /bos/status");
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&thread_diag_uri), TAG, "failed to register /bos/thread-diag");
@@ -2983,9 +2898,9 @@ esp_err_t bos_diagnostics_server_start(void)
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&ota_confirm_uri), TAG, "failed to register /bos/ota/confirm");
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&ota_rollback_uri), TAG, "failed to register /bos/ota/rollback");
     /* Route-slot budget (esp_br_web.c BOS_EXTERNAL_HANDLER_MAX; route 17 past
-     * the old cap of 16 broke the 0.1.4 OTA): this function now performs 28
-     * registrations after adding GET /bos/<spatial_id>/ proxy. The cap is
-     * raised to 28 in esp_br_web.c with zero spare external slots. */
+     * the old cap of 16 broke the 0.1.4 OTA): this function now performs 27
+     * registrations after adding POST /bos/device-id/reset. The cap is
+     * raised to 27 in esp_br_web.c with zero spare external slots. */
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&radio_get_uri), TAG, "failed to register GET /bos/radio");
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&radio_post_uri), TAG, "failed to register POST /bos/radio");
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&thread_neighbors_uri), TAG, "failed to register /bos/thread-neighbors");
@@ -2997,8 +2912,6 @@ esp_err_t bos_diagnostics_server_start(void)
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&phonebook_post_uri), TAG, "failed to register POST /bos/phonebook");
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&phonebook_floating_get_uri), TAG, "failed to register GET /bos/phonebook/floating");
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&trigger_post_uri), TAG, "failed to register POST /bos/trigger");
-    /* MUST be the last /bos route registered (wildcard catch-all). */
-    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&spatial_proxy_get_uri), TAG, "failed to register GET /bos/<spatial_id>/*");
 
     s_registered = true;
     esp_err_t confirm_err = bos_br_ota_confirm_running_app();

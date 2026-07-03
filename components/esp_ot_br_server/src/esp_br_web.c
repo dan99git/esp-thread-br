@@ -46,7 +46,10 @@
 #define FILE_CHUNK_SIZE 4096
 #define WEB_TAG "obtr_web"
 #define BOS_ADMIN_PASSWORD_HEADER "X-BOS-Admin-Password"
-#define BOS_EXTERNAL_HANDLER_MAX 16
+/* bos_diagnostics_server.c registers 28 external routes after adding
+ * the GET /bos/<spatial_id>/ spatial-id proxy (was 27); this cap also sizes
+ * httpd max_uri_handlers and max_resp_headers below. */
+#define BOS_EXTERNAL_HANDLER_MAX 28
 
 /*-----------------------------------------------------
  Note：Http Server
@@ -1439,7 +1442,7 @@ static httpd_handle_t *start_esp_br_http_server(const char *base_path, const cha
     config.max_resp_headers =
         (sizeof(s_resource_handlers) + sizeof(s_web_gui_handlers)) / sizeof(httpd_uri_t) + BOS_EXTERNAL_HANDLER_MAX + 2;
     config.uri_match_fn = httpd_uri_match_wildcard;
-    config.stack_size = 8 * 1024;
+    config.stack_size = 24 * 1024; /* BOS: phonebook POST handler stacks a ~5KB bos_phonebook_t (x2 nested via parse_csv); 8K overflowed */
     config.max_open_sockets = 7;
     config.lru_purge_enable = true;
     config.recv_wait_timeout = 2;

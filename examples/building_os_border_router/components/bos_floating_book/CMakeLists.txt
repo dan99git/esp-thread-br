@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "bos_floating_book.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        bos_time
+        freertos
+        nvs_flash
+)

@@ -7,7 +7,6 @@ idf_component_register(
         bos_br_ota
         bos_commissioning
         bos_convergence_aggregator
-        bos_floating_book
         bos_ledger_ingress
         bos_server_registration
         bos_thread_dataset_anchor
@@ -23,8 +22,6 @@ idf_component_register(
         esp_timer
         freertos
         json
-        mbedtls
-        nvs_flash
         openthread
         protocol_examples_common
 )

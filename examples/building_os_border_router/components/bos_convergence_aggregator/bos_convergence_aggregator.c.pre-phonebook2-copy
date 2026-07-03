@@ -4,7 +4,6 @@
 
 #include "bos_convergence_aggregator.h"
 
-#include "bos_floating_book.h"
 #include "bos_ledger_ingress.h"
 #include "esp_openthread.h"
 #include "esp_openthread_lock.h"
@@ -409,9 +408,6 @@ static void parse_txt_into_peer(bos_peer_t *peer, const uint8_t *txt, uint16_t t
         char value[80];
         txt_value_to_cstr(&entry, value, sizeof(value));
         // _mesh._udp TXT contract: class, model, pkg, ver, hw, mid, fw, http, cm.
-        // v3 keys (phonebook v3): sku (stock code string, may be empty),
-        // rpw (rated_power_w watts), rl (rated_lumens int, may be empty),
-        // cct (kelvin int).
         // Reserved future ledger keys from the device service: lver, ldig.
         if (strcmp(entry.mKey, "class") == 0) {
             copy_str(peer->device_class, sizeof(peer->device_class), value);
@@ -421,28 +417,6 @@ static void parse_txt_into_peer(bos_peer_t *peer, const uint8_t *txt, uint16_t t
             copy_str(peer->model, sizeof(peer->model), value);
         } else if (strcmp(entry.mKey, "mid") == 0 || strcmp(entry.mKey, "model_id") == 0) {
             copy_str(peer->model_id, sizeof(peer->model_id), value);
-        } else if (strcmp(entry.mKey, "sku") == 0) {
-            /* sku: manufacturer stock code string (e.g. "OPA-123940").
-             * Empty broadcast => empty string (recorded as null, never invented). */
-            copy_str(peer->sku, sizeof(peer->sku), value);
-        } else if (strcmp(entry.mKey, "rpw") == 0) {
-            /* rated_power_w: system/panel watts, string form (e.g. "31").
-             * Never amps. Empty broadcast => empty string. */
-            copy_str(peer->rated_power_w, sizeof(peer->rated_power_w), value);
-        } else if (strcmp(entry.mKey, "rl") == 0) {
-            /* rated_lumens: integer. Empty TXT (card omits it) => parse fails,
-             * has_rated_lumens stays false so the column renders blank/null. */
-            uint32_t lumens = 0;
-            if (parse_u32(value, &lumens)) {
-                peer->rated_lumens = (int)lumens;
-                peer->has_rated_lumens = true;
-            }
-        } else if (strcmp(entry.mKey, "cct") == 0) {
-            uint32_t cct = 0;
-            if (parse_u32(value, &cct)) {
-                peer->cct = (int)cct;
-                peer->has_cct = true;
-            }
         } else if (strcmp(entry.mKey, "pkg") == 0) {
             copy_str(peer->package_state, sizeof(peer->package_state), value);
         } else if (strcmp(entry.mKey, "ver") == 0 || strcmp(entry.mKey, "v") == 0) {
@@ -576,20 +550,6 @@ static void merge_peer(const bos_peer_t *update)
     if (update->model_id[0] != '\0') {
         copy_str(peer->model_id, sizeof(peer->model_id), update->model_id);
     }
-    if (update->sku[0] != '\0') {
-        copy_str(peer->sku, sizeof(peer->sku), update->sku);
-    }
-    if (update->rated_power_w[0] != '\0') {
-        copy_str(peer->rated_power_w, sizeof(peer->rated_power_w), update->rated_power_w);
-    }
-    if (update->has_rated_lumens) {
-        peer->rated_lumens = update->rated_lumens;
-        peer->has_rated_lumens = true;
-    }
-    if (update->has_cct) {
-        peer->cct = update->cct;
-        peer->has_cct = true;
-    }
     if (update->device_class[0] != '\0') {
         copy_str(peer->device_class, sizeof(peer->device_class), update->device_class);
     }
@@ -647,78 +607,6 @@ static bool service_name_matches_type(const char *service_name, const char *serv
     return service_name && service_type && strstr(service_name, service_type) != NULL;
 }
 
-/* True when addr is inside the mesh-local /64 but is NOT the RLOC
- * (IID 0000:00ff:fe00:xxxx): i.e. the stable ML-EID the floating book
- * records (spec column 9: eid is the ML-EID, never the OMR). */
-static bool addr_is_ml_eid(const otIp6Address *addr, const otMeshLocalPrefix *mlp)
-{
-    if (!addr || !mlp || memcmp(addr->mFields.m8, mlp->m8, OT_MESH_LOCAL_PREFIX_SIZE) != 0) {
-        return false;
-    }
-    const uint8_t *iid = &addr->mFields.m8[8];
-    bool is_rloc_iid = iid[0] == 0x00U && iid[1] == 0x00U && iid[2] == 0x00U &&
-                       iid[3] == 0xffU && iid[4] == 0xfeU && iid[5] == 0x00U;
-    return !is_rloc_iid;
-}
-
-/* Floating-book touch (spec docs/scratch/phonebook-v2-two-book-spec.md
- * section 3 step 2): an SRP-registered _mesh._udp peer that is not
- * commissioned (TXT cm absent or != 1) gets a BR-authored floating row.
- * Runs under the held OT lock; bos_floating_book_touch is RAM-only, the NVS
- * persist happens off the lock in browse_task. */
-static void floating_book_note_peer(const otSrpServerHost *host, const bos_peer_t *update)
-{
-    if (!update || update->hardware_id[0] == '\0') {
-        return; /* no durable EUI-64 key: nothing to record */
-    }
-    if (update->has_commissioned && update->commissioned) {
-        return; /* paired devices belong to the operational book */
-    }
-
-    char eid_str[46] = "";
-    otInstance *instance = esp_openthread_get_instance();
-    if (instance) {
-        const otMeshLocalPrefix *mlp = otThreadGetMeshLocalPrefix(instance);
-        uint8_t address_count = 0;
-        const otIp6Address *addresses = otSrpServerHostGetAddresses(host, &address_count);
-        for (uint8_t i = 0; addresses && i < address_count; i++) {
-            if (addr_is_ml_eid(&addresses[i], mlp)) {
-                otIp6AddressToString(&addresses[i], eid_str, sizeof(eid_str));
-                break;
-            }
-        }
-    }
-
-    /* Photometric columns (phonebook v3). Ints render to strings; absent
-     * lumens/cct stay empty so the floating row records blank, per spec. */
-    char rated_lumens_str[12] = "";
-    char cct_str[8] = "";
-    if (update->has_rated_lumens) {
-        snprintf(rated_lumens_str, sizeof(rated_lumens_str), "%d", update->rated_lumens);
-    }
-    if (update->has_cct) {
-        snprintf(cct_str, sizeof(cct_str), "%d", update->cct);
-    }
-
-    bos_floating_touch_t touch = {
-        .eui64 = update->hardware_id,
-        .device_id = update->id,
-        .device_class = update->device_class,
-        .model_id = update->model_id,
-        .fw = update->firmware_version,
-        .eid = eid_str,
-        .sku = update->sku,
-        .rated_power_w = update->rated_power_w,
-        .rated_lumens = rated_lumens_str,
-        .cct = cct_str,
-    };
-    esp_err_t err = bos_floating_book_touch(&touch);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_ARG) {
-        ESP_LOGW(TAG, "floating-book touch failed for %s: %s",
-                 update->hardware_id, esp_err_to_name(err));
-    }
-}
-
 static void merge_srp_server_service(const otSrpServerHost *host, const otSrpServerService *service)
 {
     const char *service_name = otSrpServerServiceGetServiceName(service);
@@ -771,9 +659,6 @@ static void merge_srp_server_service(const otSrpServerHost *host, const otSrpSer
 
     if (!is_self_srp_record(&update)) {
         merge_peer(&update);
-        if (is_mesh) {
-            floating_book_note_peer(host, &update);
-        }
     }
 }
 
@@ -833,9 +718,6 @@ static void browse_task(void *arg)
         }
         scan_srp_server_services(instance);
         esp_openthread_lock_release();
-        /* NVS commit for any floating-book rows touched during the scan;
-         * deliberately off the OT lock. */
-        bos_floating_book_persist_if_dirty();
         vTaskDelay(pdMS_TO_TICKS(BOS_AGG_BROWSE_PERIOD_MS));
     }
 }
@@ -980,50 +862,7 @@ static int append_peer_json(char **cursor,
         append_json_string(cursor, remaining, peer->model) < 0 ||
         appendf(cursor, remaining, ",\"model_id\":") < 0 ||
         append_json_string(cursor, remaining, peer->model_id[0] != '\0' ? peer->model_id : peer->model) < 0 ||
-        appendf(cursor, remaining, ",\"sku\":") < 0) {
-        return -1;
-    }
-    /* sku (phonebook v3 col 7): manufacturer stock code; absent => null. */
-    if (peer->sku[0] != '\0') {
-        if (append_json_string(cursor, remaining, peer->sku) < 0) {
-            return -1;
-        }
-    } else if (appendf(cursor, remaining, "null") < 0) {
-        return -1;
-    }
-    if (appendf(cursor, remaining, ",\"rated_power_w\":") < 0) {
-        return -1;
-    }
-    /* v3 photometric properties the gateway phonebook-publisher reads by these
-     * exact names. rated_power_w is a string (watts); absent => null. */
-    if (peer->rated_power_w[0] != '\0') {
-        if (append_json_string(cursor, remaining, peer->rated_power_w) < 0) {
-            return -1;
-        }
-    } else if (appendf(cursor, remaining, "null") < 0) {
-        return -1;
-    }
-    if (appendf(cursor, remaining, ",\"rated_lumens\":") < 0) {
-        return -1;
-    }
-    if (peer->has_rated_lumens) {
-        if (appendf(cursor, remaining, "%d", peer->rated_lumens) < 0) {
-            return -1;
-        }
-    } else if (appendf(cursor, remaining, "null") < 0) {
-        return -1;
-    }
-    if (appendf(cursor, remaining, ",\"cct\":") < 0) {
-        return -1;
-    }
-    if (peer->has_cct) {
-        if (appendf(cursor, remaining, "%d", peer->cct) < 0) {
-            return -1;
-        }
-    } else if (appendf(cursor, remaining, "null") < 0) {
-        return -1;
-    }
-    if (appendf(cursor, remaining, ",\"fw\":") < 0 ||
+        appendf(cursor, remaining, ",\"fw\":") < 0 ||
         append_json_string(cursor, remaining, peer->firmware_version) < 0 ||
         appendf(cursor, remaining, ",\"http\":") < 0) {
         return -1;

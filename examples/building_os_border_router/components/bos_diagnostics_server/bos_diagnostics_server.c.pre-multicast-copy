@@ -5,7 +5,6 @@
 #include "bos_diagnostics_server.h"
 
 #include <ctype.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +12,6 @@
 
 #include "bos_commissioning.h"
 #include "bos_convergence_aggregator.h"
-#include "bos_floating_book.h"
 #include "bos_joiner.h"
 #include "bos_thread_dataset_anchor.h"
 #include "bos_thread_diag.h"
@@ -35,10 +33,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "mbedtls/sha256.h"
-#include "nvs.h"
 #include "openthread/coap.h"
 #include "openthread/dns.h"
 #include "openthread/instance.h"
@@ -60,65 +55,6 @@ static char s_backbone_ipv4[16] = "";
 static bool s_backbone_has_ipv6;
 static char s_backbone_ipv6[40] = "";
 static char s_backbone_if[24] = "unknown";
-
-#define BOS_PHONEBOOK_NVS_NAMESPACE "bos_phonebook"
-#define BOS_PHONEBOOK_NVS_KEY "book"
-#define BOS_PHONEBOOK_BODY_MAX 32768
-#define BOS_PHONEBOOK_MAX_ROWS 64
-#define BOS_PHONEBOOK_MESH_PATH "mesh/phonebook"
-#define BOS_PHONEBOOK_DIGEST_HEX_LEN 64
-#define BOS_PHONEBOOK_VERSION_MAX 24
-#define BOS_PHONEBOOK_DIGEST_MAX 96
-#define BOS_PHONEBOOK_GENERATED_AT_MAX 48
-#define BOS_PHONEBOOK_DEVICE_ID_MAX 96
-#define BOS_PHONEBOOK_SPATIAL_ID_MAX 128
-#define BOS_PHONEBOOK_DEVICE_CLASS_MAX 48
-#define BOS_PHONEBOOK_TAGS_MAX 160
-#define BOS_PHONEBOOK_COORD_MAX 32
-/* v3 operational book (phonebook v3, 17 columns, exact order). This is the
- * ONLY accepted format: a v2 (14-col) or v1 (9-col) document hard-rejects at
- * the magic line and again at the column-header cross-check - no silent
- * fallback. v3 rows carry make/model/model_id/photometry in the stored raw
- * document; only eui64/device_class/spatial_id/tags/x/y/z/eid are parsed into
- * the resolve + spatial-proxy table. The gateway still mints the version
- * (BR-owned version authority remains a follow-up). */
-#define BOS_PHONEBOOK_COLUMNS_V3 \
-    "eui64,device_id,device_class,make,model,model_id,sku,fw,rated_power_w,rated_lumens,cct,discovered_at,eid,x,y,z,spatial_id,tags"
-#define BOS_PHONEBOOK_FIELDS_MAX 18
-
-typedef struct {
-    char eui64[17];
-    char device_id[BOS_PHONEBOOK_DEVICE_ID_MAX];
-    char spatial_id[BOS_PHONEBOOK_SPATIAL_ID_MAX];
-    char device_class[BOS_PHONEBOOK_DEVICE_CLASS_MAX];
-    char tags[BOS_PHONEBOOK_TAGS_MAX];
-    char x[BOS_PHONEBOOK_COORD_MAX];
-    char y[BOS_PHONEBOOK_COORD_MAX];
-    char z[BOS_PHONEBOOK_COORD_MAX];
-    char eid[OT_IP6_ADDRESS_STRING_SIZE];
-    otIp6Address address;
-} bos_phonebook_row_t;
-
-typedef struct {
-    bool loaded;
-    int columns_version; /* 3 = 17-col v3 (only accepted format) */
-    char version[BOS_PHONEBOOK_VERSION_MAX];
-    char digest[BOS_PHONEBOOK_DIGEST_MAX];
-    char generated_at[BOS_PHONEBOOK_GENERATED_AT_MAX];
-    size_t row_count;
-    bos_phonebook_row_t rows[BOS_PHONEBOOK_MAX_ROWS];
-} bos_phonebook_t;
-
-static SemaphoreHandle_t s_phonebook_lock;
-static bos_phonebook_t s_phonebook;
-
-typedef struct {
-    uint16_t attempted;
-    uint16_t sent;
-    uint16_t failed;
-    uint16_t bad_scope;
-    char first_error[64];
-} bos_phonebook_mesh_push_t;
 
 static bool is_backbone_netif(esp_netif_t *netif)
 {
@@ -933,134 +869,6 @@ static esp_err_t thread_reset_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* POST /bos/device-id/reset: confirm-gated identity reset. Erases the NVS
- * bos_reg/device_id override AND bos_reg/device_token so the next boot
- * re-derives the EUI-64 device id (bos_server_registration.c load_device_id:
- * ESP_MAC_IEEE802154, else base MAC with ff:fe inserted), persists it, and
- * re-claims with the site server under the new id. Shipped to flip the
- * legacy colon-MAC identity ("9c:13:9e:0a:47:47") to the durable EUI-64
- * without reflashing: the override wins over derivation, so OTA alone cannot
- * fix it. The token erase is load-bearing (0.1.21 fix, live defect on the
- * 0.1.20 bench run 2026-07-02): with the old token kept, is_registered()
- * stays true, the registration task never re-claims, the gateway never
- * learns the new id, and every heartbeat 404s into the RAM buffer.
- * Token-authed write, same trust anchor as /bos/ota/app (X-Device-Token /
- * api key via bos_commissioning_request_authorized). Refusal shape mirrors
- * the C6 install-retrigger 428 plan (firmware/xiao-esp32c6/main/
- * web_routes_card.c handle_api_install_retrigger): {"confirm": true}
- * required in the JSON body; without it the route returns the exact plan and
- * takes no action. On accept the 200 response is sent FIRST, then the
- * two-key erase runs and the BR restarts after a flush delay. A failed erase
- * logs ESP_LOGE and does NOT restart. */
-static esp_err_t device_id_reset_post_handler(httpd_req_t *req)
-{
-    if (!bos_commissioning_request_authorized(req)) {
-        return send_unauthorized(req);
-    }
-
-    char body[160];
-    if (read_request_body(req, body, sizeof(body)) < 0) {
-        return send_status_json(req, "400 Bad Request", "empty or oversized body");
-    }
-    cJSON *root = cJSON_Parse(body);
-    if (!root) {
-        return send_status_json(req, "400 Bad Request", "invalid JSON");
-    }
-    const cJSON *confirm_j = cJSON_GetObjectItemCaseSensitive(root, "confirm");
-    bool confirmed = cJSON_IsTrue(confirm_j);
-    cJSON_Delete(root);
-
-    char current_id[64] = "";
-    if (bos_server_registration_get_device_id(current_id, sizeof(current_id)) != ESP_OK) {
-        current_id[0] = '\0';
-    }
-
-    if (!confirmed) {
-        cJSON *resp = cJSON_CreateObject();
-        if (!resp) {
-            return send_status_json(req, "500 Internal Server Error", "out of memory");
-        }
-        cJSON_AddBoolToObject(resp, "ok", false);
-        cJSON_AddBoolToObject(resp, "erase_executed", false);
-        cJSON_AddStringToObject(resp, "refusal", "confirmation_required");
-        cJSON_AddStringToObject(resp, "required_confirmation", "{\"confirm\": true}");
-        cJSON *plan = cJSON_CreateObject();
-        cJSON_AddStringToObject(plan, "nvs_namespace", BOS_REG_NVS_NAMESPACE);
-        cJSON *keys = cJSON_CreateArray();
-        cJSON_AddItemToArray(keys, cJSON_CreateString(BOS_REG_KEY_DEVICE_ID));
-        cJSON_AddItemToArray(keys, cJSON_CreateString(BOS_REG_KEY_TOKEN));
-        cJSON_AddItemToObject(plan, "nvs_keys", keys);
-        cJSON_AddStringToObject(plan, "current_device_id", current_id);
-        cJSON *effect = cJSON_CreateArray();
-        cJSON_AddItemToArray(effect, cJSON_CreateString(
-            "NVS keys bos_reg/device_id and bos_reg/device_token erased (server_url and all other keys untouched)"));
-        cJSON_AddItemToArray(effect, cJSON_CreateString(
-            "the BR restarts right after the erase"));
-        cJSON_AddItemToArray(effect, cJSON_CreateString(
-            "on boot the device id is re-derived as EUI-64 (ESP_MAC_IEEE802154, else base MAC with ff:fe inserted), persisted to NVS, and the BR re-claims with the site server under the new id for a fresh token"));
-        cJSON_AddItemToObject(plan, "effect", effect);
-        cJSON_AddStringToObject(plan, "why",
-            "The NVS device_id override wins over EUI-64 derivation (load_device_id override-first), so the legacy colon-MAC id survives every OTA; the old token must also go or is_registered() stays true and the BR never re-claims, leaving the gateway on the old id and heartbeats failing.");
-        cJSON_AddItemToObject(resp, "plan", plan);
-        httpd_resp_set_status(req, "428 Precondition Required");
-        esp_err_t ret = send_cjson(req, resp);
-        cJSON_Delete(resp);
-        return ret;
-    }
-
-    cJSON *resp = cJSON_CreateObject();
-    if (!resp) {
-        return send_status_json(req, "500 Internal Server Error", "out of memory");
-    }
-    cJSON_AddBoolToObject(resp, "ok", true);
-    cJSON_AddBoolToObject(resp, "rebooting", true);
-    cJSON_AddStringToObject(resp, "old_device_id", current_id);
-    cJSON_AddStringToObject(resp, "derivation", "eui64");
-    esp_err_t ret = send_cjson(req, resp);
-    cJSON_Delete(resp);
-
-    /* Response is sent; give lwip time to flush the socket before the erase
-     * and restart (same flush model as the C6 install retrigger). */
-    vTaskDelay(pdMS_TO_TICKS(750));
-
-    nvs_handle_t nvs;
-    esp_err_t err = nvs_open(BOS_REG_NVS_NAMESPACE, NVS_READWRITE, &nvs);
-    if (err == ESP_OK) {
-        err = nvs_erase_key(nvs, BOS_REG_KEY_DEVICE_ID);
-        if (err == ESP_ERR_NVS_NOT_FOUND) {
-            /* No override stored: nothing to erase, boot derivation already
-             * rules. Proceed to the token erase. */
-            err = ESP_OK;
-        }
-        if (err == ESP_OK) {
-            /* Token erase is load-bearing: with the old token kept,
-             * is_registered() stays true and the BR never re-claims under
-             * the re-derived id (0.1.20 live defect, 2026-07-02). */
-            err = nvs_erase_key(nvs, BOS_REG_KEY_TOKEN);
-            if (err == ESP_ERR_NVS_NOT_FOUND) {
-                err = ESP_OK;
-            }
-        }
-        if (err == ESP_OK) {
-            err = nvs_commit(nvs);
-        }
-        nvs_close(nvs);
-    }
-    if (err != ESP_OK) {
-        /* Loud failure, no restart: rebooting after a failed erase would just
-         * re-register the legacy id and mask the fault. The 200 response is
-         * already sent, so the log is the only remaining reporting channel. */
-        ESP_LOGE(TAG, "device-id reset: NVS erase of %s/%s+%s FAILED (%s); NOT restarting",
-                 BOS_REG_NVS_NAMESPACE, BOS_REG_KEY_DEVICE_ID, BOS_REG_KEY_TOKEN, esp_err_to_name(err));
-        return ret;
-    }
-    ESP_LOGI(TAG, "device-id reset: NVS %s/%s and %s erased (old id \"%s\"); restarting to re-derive EUI-64 and re-claim",
-             BOS_REG_NVS_NAMESPACE, BOS_REG_KEY_DEVICE_ID, BOS_REG_KEY_TOKEN, current_id);
-    vTaskDelay(pdMS_TO_TICKS(250));
-    esp_restart();
-    return ret; /* not reached */
-}
-
 /* ------------------------------------------------------------------------
  * /bos/device/<eui64>/<path...>: the BR device-UI proxy (control-plane
  * slice 0, docs/scratch/control-plane doc; THE route the over-Thread goal
@@ -1186,32 +994,13 @@ static proxy_addr_scope_t proxy_classify_address(const otIp6Address *addr,
     return PROXY_SCOPE_ROUTABLE;
 }
 
-static int proxy_http_scope_rank(proxy_addr_scope_t scope)
-{
-    return (int)scope;
-}
-
-static int trigger_coap_scope_rank(proxy_addr_scope_t scope)
-{
-    switch (scope) {
-    case PROXY_SCOPE_MESH_LOCAL:
-        return 4;
-    default:
-        return 0;
-    }
-}
-
 /* SRP host walk under the held OT lock. The _mesh._udp TXT contract
  * publishes the EUI-64 under hw (aliases hid/eui64/hardware_id; see
  * bos_convergence_aggregator parse_txt_into_peer) and the device web port
- * under http (default 80). The caller supplies the address-scope ranking:
- * HTTP proxy prefers routable OMR; CoAP trigger prefers mesh-local Thread
- * addresses. */
-static bool resolve_eui64_srp(otInstance *instance,
-                              const char *eui64,
-                              proxy_target_t *out,
-                              proxy_addr_scope_t *scope_out,
-                              int (*scope_rank)(proxy_addr_scope_t scope))
+ * under http (default 80). Returns true with the BEST-SCOPED host address
+ * (routable OMR preferred over mesh-local/rloc/link-local) when a TXT entry
+ * matches the canonical EUI-64. */
+static bool proxy_resolve_eui64(otInstance *instance, const char *eui64, proxy_target_t *out)
 {
     if (otSrpServerGetState(instance) != OT_SRP_SERVER_STATE_RUNNING) {
         return false;
@@ -1269,858 +1058,39 @@ static bool resolve_eui64_srp(otInstance *instance,
         }
 
         /* Pick the best-scoped registered address rather than the first
-         * non-zero one. A device registers several addresses; HTTP and CoAP
-         * need different scopes, so ranking is supplied by the caller. */
+         * non-zero one. A device registers several addresses; only the
+         * routable OMR address is reachable for the esp_http_client forward.
+         * Prefer routable > mesh-local > rloc > link-local; skip unusable
+         * (unspecified/multicast). This removes the intermittent 502 that
+         * occurred when the first SRP entry happened to be a non-routable
+         * (mesh-local/rloc/link-local) address. */
         uint8_t address_count = 0;
         const otIp6Address *addresses = otSrpServerHostGetAddresses(host, &address_count);
         const otIp6Address *best = NULL;
         proxy_addr_scope_t best_scope = PROXY_SCOPE_UNUSABLE;
-        int best_rank = 0;
         for (uint8_t i = 0; addresses && i < address_count; i++) {
             proxy_addr_scope_t scope = proxy_classify_address(&addresses[i], mlp);
-            int rank = scope_rank(scope);
-            if (rank > best_rank) {
-                best_rank = rank;
+            if (scope > best_scope) {
                 best_scope = scope;
                 best = &addresses[i];
             }
         }
-        if (best != NULL && best_rank > 0) {
+        if (best != NULL && best_scope != PROXY_SCOPE_UNUSABLE) {
             out->address = *best;
             out->http_port = http_port;
-            if (scope_out) {
-                *scope_out = best_scope;
+            if (best_scope != PROXY_SCOPE_ROUTABLE) {
+                /* Reachable-but-suboptimal: no routable OMR address was
+                 * registered (e.g. mid-reform before the C6 re-registers).
+                 * Forward anyway on the best available, but log it so a
+                 * persistent non-routable selection is visible at the bench. */
+                ESP_LOGW(TAG,
+                         "proxy resolve %s: no routable address registered, "
+                         "forwarding on scope=%d", eui64, (int)best_scope);
             }
             return true;
         }
     }
     return false;
-}
-
-static bool proxy_resolve_eui64(otInstance *instance, const char *eui64, proxy_target_t *out)
-{
-    proxy_addr_scope_t scope = PROXY_SCOPE_UNUSABLE;
-    bool resolved = resolve_eui64_srp(instance, eui64, out, &scope, proxy_http_scope_rank);
-    if (resolved && scope != PROXY_SCOPE_ROUTABLE) {
-        /* Reachable-but-suboptimal: no routable OMR address was registered
-         * (e.g. mid-reform before the C6 re-registers). Forward anyway on the
-         * best available, but log it so a persistent non-routable selection is
-         * visible at the bench. */
-        ESP_LOGW(TAG,
-                 "proxy resolve %s: no routable address registered, "
-                 "forwarding on scope=%d", eui64, (int)scope);
-    }
-    return resolved;
-}
-
-static bool trigger_resolve_eui64(otInstance *instance,
-                                  const char *eui64,
-                                  proxy_target_t *out,
-                                  proxy_addr_scope_t *scope_out)
-{
-    proxy_addr_scope_t scope = PROXY_SCOPE_UNUSABLE;
-    bool resolved = resolve_eui64_srp(instance, eui64, out, &scope, trigger_coap_scope_rank);
-    if (scope_out) {
-        *scope_out = scope;
-    }
-    return resolved;
-}
-
-static char *phonebook_trim(char *value)
-{
-    while (*value != '\0' && isspace((unsigned char)*value)) {
-        value++;
-    }
-    char *end = value + strlen(value);
-    while (end > value && isspace((unsigned char)end[-1])) {
-        end--;
-    }
-    *end = '\0';
-    return value;
-}
-
-static esp_err_t phonebook_copy_field(char *dst, size_t dst_len, const char *src)
-{
-    if (!dst || dst_len == 0U || !src || strlen(src) >= dst_len) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    memcpy(dst, src, strlen(src) + 1);
-    return ESP_OK;
-}
-
-static int phonebook_csv_split(char *line, char **fields, size_t max_fields)
-{
-    if (!line || !fields || max_fields == 0U) {
-        return -1;
-    }
-
-    size_t count = 1;
-    bool in_quotes = false;
-    bool at_field_start = true;
-    char *src = line;
-    char *dst = line;
-    fields[0] = dst;
-
-    while (*src != '\0') {
-        char ch = *src++;
-        if (in_quotes) {
-            if (ch == '"') {
-                if (*src == '"') {
-                    *dst++ = '"';
-                    src++;
-                } else {
-                    in_quotes = false;
-                }
-            } else {
-                *dst++ = ch;
-            }
-            continue;
-        }
-
-        if (ch == ',') {
-            if (count >= max_fields) {
-                return -1;
-            }
-            *dst++ = '\0';
-            fields[count++] = dst;
-            at_field_start = true;
-            continue;
-        }
-        if (ch == '"' && at_field_start) {
-            in_quotes = true;
-            at_field_start = false;
-            continue;
-        }
-        *dst++ = ch;
-        if (!isspace((unsigned char)ch)) {
-            at_field_start = false;
-        }
-    }
-    if (in_quotes) {
-        return -1;
-    }
-    *dst = '\0';
-
-    for (size_t i = 0; i < count; i++) {
-        fields[i] = phonebook_trim(fields[i]);
-    }
-    return (int)count;
-}
-
-static bool phonebook_is_ascii_digit_string(const char *value)
-{
-    if (!value || value[0] == '\0') {
-        return false;
-    }
-    for (const char *p = value; *p != '\0'; p++) {
-        if (!isdigit((unsigned char)*p)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool phonebook_is_sha256_hex(const char *value)
-{
-    if (!value || strlen(value) != BOS_PHONEBOOK_DIGEST_HEX_LEN) {
-        return false;
-    }
-    for (const char *p = value; *p != '\0'; p++) {
-        if (!isxdigit((unsigned char)*p)) {
-            return false;
-        }
-        if (isalpha((unsigned char)*p) && !islower((unsigned char)*p)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static void phonebook_sha256_hex(const char *body, size_t body_len, char out[BOS_PHONEBOOK_DIGEST_HEX_LEN + 1])
-{
-    static const char hex[] = "0123456789abcdef";
-    uint8_t digest[32];
-    if (mbedtls_sha256((const unsigned char *)body, body_len, digest, 0) != 0) {
-        out[0] = '\0';
-        return;
-    }
-    for (size_t i = 0; i < sizeof(digest); i++) {
-        out[i * 2] = hex[digest[i] >> 4];
-        out[i * 2 + 1] = hex[digest[i] & 0x0f];
-    }
-    out[BOS_PHONEBOOK_DIGEST_HEX_LEN] = '\0';
-}
-
-static esp_err_t phonebook_parse_comment_header(const char *line,
-                                                bos_phonebook_t *book,
-                                                char *error,
-                                                size_t error_len)
-{
-    char version[BOS_PHONEBOOK_VERSION_MAX] = "";
-    char digest[BOS_PHONEBOOK_DIGEST_MAX] = "";
-    char generated_at[BOS_PHONEBOOK_GENERATED_AT_MAX] = "";
-    char extra = '\0';
-    /* v3 magic only ("bos-phonebook-v3", 17-col docs). A v2 ("bos-phonebook-v2")
-     * or v1 ("bos-phonebook") magic fails this literal sscanf and is rejected
-     * here with NO fallback. The version seen is recorded in
-     * book->columns_version and cross-checked against the column-header line by
-     * the caller. */
-    int matched = sscanf(line,
-                         "# bos-phonebook-v3 version=%23s digest=%95s generated_at=%47s %c",
-                         version,
-                         digest,
-                         generated_at,
-                         &extra);
-    if (matched != 3) {
-        snprintf(error, error_len, "phonebook: missing or invalid comment header");
-        return ESP_ERR_INVALID_ARG;
-    }
-    book->columns_version = 3;
-    if (!phonebook_is_ascii_digit_string(version)) {
-        snprintf(error, error_len, "phonebook: invalid version");
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (!phonebook_is_sha256_hex(digest)) {
-        snprintf(error, error_len, "phonebook: invalid digest");
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (generated_at[0] == '\0') {
-        snprintf(error, error_len, "phonebook: invalid generated_at");
-        return ESP_ERR_INVALID_ARG;
-    }
-    ESP_RETURN_ON_ERROR(phonebook_copy_field(book->version, sizeof(book->version), version), TAG, "version too long");
-    ESP_RETURN_ON_ERROR(phonebook_copy_field(book->digest, sizeof(book->digest), digest), TAG, "digest too long");
-    ESP_RETURN_ON_ERROR(phonebook_copy_field(book->generated_at, sizeof(book->generated_at), generated_at), TAG, "generated_at too long");
-    return ESP_OK;
-}
-
-static esp_err_t phonebook_parse_row(char **fields, int count, bos_phonebook_t *book)
-{
-    /* v3: eui64,device_id,device_class,make,model,model_id,sku,fw,
-     *     rated_power_w,rated_lumens,cct,discovered_at,eid,x,y,z,spatial_id,
-     *     tags (18 cols). Keys on eui64 and requires a parseable eid for the
-     *     BR resolve + spatial-proxy table. make/model/model_id/sku/photometry
-     *     pass through in the stored raw document; not needed by the resolve
-     *     table. */
-    const int eid_idx = 12; /* eid is column 13 in v3 */
-    if (count != 18 || book->row_count >= BOS_PHONEBOOK_MAX_ROWS ||
-        fields[0][0] == '\0' || fields[eid_idx][0] == '\0') {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    bos_phonebook_row_t row = {0};
-    if (!proxy_normalise_eui64(fields[0], strlen(fields[0]), row.eui64)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (otIp6AddressFromString(fields[eid_idx], &row.address) != OT_ERROR_NONE) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    ESP_RETURN_ON_ERROR(phonebook_copy_field(row.device_id, sizeof(row.device_id), fields[1]), TAG, "device_id too long");
-    ESP_RETURN_ON_ERROR(phonebook_copy_field(row.eid, sizeof(row.eid), fields[eid_idx]), TAG, "eid too long");
-    ESP_RETURN_ON_ERROR(phonebook_copy_field(row.device_class, sizeof(row.device_class), fields[2]), TAG, "device_class too long");
-    ESP_RETURN_ON_ERROR(phonebook_copy_field(row.x, sizeof(row.x), fields[13]), TAG, "x too long");
-    ESP_RETURN_ON_ERROR(phonebook_copy_field(row.y, sizeof(row.y), fields[14]), TAG, "y too long");
-    ESP_RETURN_ON_ERROR(phonebook_copy_field(row.z, sizeof(row.z), fields[15]), TAG, "z too long");
-    ESP_RETURN_ON_ERROR(phonebook_copy_field(row.spatial_id, sizeof(row.spatial_id), fields[16]), TAG, "spatial_id too long");
-    ESP_RETURN_ON_ERROR(phonebook_copy_field(row.tags, sizeof(row.tags), fields[17]), TAG, "tags too long");
-
-    book->rows[book->row_count++] = row;
-    return ESP_OK;
-}
-
-static char *phonebook_lf_body(const char *body, char *error, size_t error_len)
-{
-    size_t body_len = strlen(body);
-    char *normal = malloc(body_len + 1U);
-    if (!normal) {
-        snprintf(error, error_len, "out of memory");
-        return NULL;
-    }
-    size_t out = 0;
-    for (size_t i = 0; i < body_len; i++) {
-        if (body[i] == '\r') {
-            if (body[i + 1U] == '\n') {
-                continue;
-            }
-            normal[out++] = '\n';
-            continue;
-        }
-        normal[out++] = body[i];
-    }
-    normal[out] = '\0';
-    return normal;
-}
-
-static esp_err_t phonebook_parse_csv(const char *raw,
-                                     bos_phonebook_t *out,
-                                     char computed_digest[BOS_PHONEBOOK_DIGEST_HEX_LEN + 1],
-                                     char *error,
-                                     size_t error_len)
-{
-    if (!raw || !out || !computed_digest || !error || error_len == 0U) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    error[0] = '\0';
-    computed_digest[0] = '\0';
-
-    size_t raw_len = strlen(raw);
-    if (raw_len == 0U || raw_len >= BOS_PHONEBOOK_BODY_MAX) {
-        snprintf(error, error_len, "empty or oversized phonebook");
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    const char *newline = strchr(raw, '\n');
-    if (!newline) {
-        snprintf(error, error_len, "phonebook: missing body");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    size_t header_len = (size_t)(newline - raw);
-    if (header_len > 0U && raw[header_len - 1U] == '\r') {
-        header_len--;
-    }
-    char header[192];
-    if (header_len == 0U || header_len >= sizeof(header)) {
-        snprintf(error, error_len, "phonebook: invalid comment header");
-        return ESP_ERR_INVALID_ARG;
-    }
-    memcpy(header, raw, header_len);
-    header[header_len] = '\0';
-
-    const char *body = newline + 1;
-    if (body[0] == '\0') {
-        snprintf(error, error_len, "phonebook: missing body");
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    char *hash_body = phonebook_lf_body(body, error, error_len);
-    if (!hash_body) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    /* Heap-allocated: bos_phonebook_t is ~39 KB and overflows task stacks. */
-    bos_phonebook_t *book = calloc(1, sizeof(*book));
-    if (!book) {
-        snprintf(error, error_len, "out of memory");
-        free(hash_body);
-        return ESP_ERR_NO_MEM;
-    }
-    esp_err_t header_err = phonebook_parse_comment_header(header, book, error, error_len);
-    if (header_err != ESP_OK) {
-        free(hash_body);
-        free(book);
-        return header_err;
-    }
-
-    phonebook_sha256_hex(hash_body, strlen(hash_body), computed_digest);
-    if (computed_digest[0] == '\0') {
-        snprintf(error, error_len, "phonebook: digest computation failed");
-        free(hash_body);
-        free(book);
-        return ESP_FAIL;
-    }
-    if (strcmp(computed_digest, book->digest) != 0) {
-        snprintf(error, error_len, "phonebook: digest mismatch");
-        free(hash_body);
-        free(book);
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    /* v3 only: the column header must be the exact 17-col v3 literal. A v2
-     * (14-col) or v1 (9-col) header fails this and is rejected here - the
-     * second, independent rejection point after the magic line. */
-    size_t columns_len = strlen(BOS_PHONEBOOK_COLUMNS_V3);
-    int columns_version = 0;
-    if (strncmp(hash_body, BOS_PHONEBOOK_COLUMNS_V3, columns_len) == 0 && hash_body[columns_len] == '\n') {
-        columns_version = 3;
-    } else {
-        snprintf(error, error_len, "phonebook: column header mismatch");
-        free(hash_body);
-        free(book);
-        return ESP_ERR_INVALID_ARG;
-    }
-    /* The magic recorded from line 1 must agree with the column header:
-     * v3 magic requires the 17-col line. */
-    if (columns_version != book->columns_version) {
-        snprintf(error, error_len, "phonebook: magic/column header version mismatch");
-        free(hash_body);
-        free(book);
-        return ESP_ERR_INVALID_ARG;
-    }
-    const char *rows_body = hash_body + columns_len + 1U;
-
-    char *copy = malloc(strlen(rows_body) + 1U);
-    if (!copy) {
-        snprintf(error, error_len, "out of memory");
-        free(hash_body);
-        free(book);
-        return ESP_ERR_NO_MEM;
-    }
-    memcpy(copy, rows_body, strlen(rows_body) + 1U);
-    free(hash_body);
-
-    size_t line_no = 2;
-    char *save = NULL;
-    for (char *line = strtok_r(copy, "\n", &save); line != NULL; line = strtok_r(NULL, "\n", &save)) {
-        line_no++;
-        line = phonebook_trim(line);
-        if (line[0] == '\0') {
-            continue;
-        }
-
-        char *fields[BOS_PHONEBOOK_FIELDS_MAX] = {0};
-        int count = phonebook_csv_split(line, fields, sizeof(fields) / sizeof(fields[0]));
-        if (count < 0) {
-            snprintf(error, error_len, "invalid CSV at line %u", (unsigned)line_no);
-            free(copy);
-            free(book);
-            return ESP_ERR_INVALID_ARG;
-        }
-        if (phonebook_parse_row(fields, count, book) != ESP_OK) {
-            snprintf(error, error_len, "invalid phonebook row at line %u", (unsigned)line_no);
-            free(copy);
-            free(book);
-            return ESP_ERR_INVALID_ARG;
-        }
-    }
-    free(copy);
-
-    if (book->row_count == 0U) {
-        snprintf(error, error_len, "phonebook has no rows");
-        free(book);
-        return ESP_ERR_INVALID_ARG;
-    }
-    book->loaded = true;
-    *out = *book;
-    free(book);
-    return ESP_OK;
-}
-
-static esp_err_t phonebook_validate_push_headers(httpd_req_t *req,
-                                                 const bos_phonebook_t *book,
-                                                 const char *computed_digest,
-                                                 char *error,
-                                                 size_t error_len)
-{
-    char header_version[BOS_PHONEBOOK_VERSION_MAX] = "";
-    char header_digest[BOS_PHONEBOOK_DIGEST_MAX] = "";
-    if (httpd_req_get_hdr_value_str(req, "X-Phonebook-Version", header_version, sizeof(header_version)) != ESP_OK) {
-        snprintf(error, error_len, "missing X-Phonebook-Version");
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (httpd_req_get_hdr_value_str(req, "X-Phonebook-Digest", header_digest, sizeof(header_digest)) != ESP_OK) {
-        snprintf(error, error_len, "missing X-Phonebook-Digest");
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (strcmp(header_version, book->version) != 0) {
-        snprintf(error, error_len, "X-Phonebook-Version does not match document header");
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (!phonebook_is_sha256_hex(header_digest)) {
-        snprintf(error, error_len, "invalid X-Phonebook-Digest");
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (strcmp(header_digest, book->digest) != 0 || strcmp(header_digest, computed_digest) != 0) {
-        snprintf(error, error_len, "X-Phonebook-Digest does not match phonebook body");
-        return ESP_ERR_INVALID_ARG;
-    }
-    return ESP_OK;
-}
-
-static esp_err_t phonebook_apply(const bos_phonebook_t *book)
-{
-    if (!book || !s_phonebook_lock) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (xSemaphoreTake(s_phonebook_lock, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-    s_phonebook = *book;
-    xSemaphoreGive(s_phonebook_lock);
-    return ESP_OK;
-}
-
-static void phonebook_mesh_push_set_error(bos_phonebook_mesh_push_t *push, const char *error)
-{
-    if (!push || !error || push->first_error[0] != '\0') {
-        return;
-    }
-    snprintf(push->first_error, sizeof(push->first_error), "%s", error);
-}
-
-static otError phonebook_emit_coap(otInstance *instance,
-                                   const otIp6Address *dest,
-                                   const char *payload,
-                                   size_t payload_len)
-{
-    if (!instance || !dest || !payload || payload_len == 0U || payload_len > UINT16_MAX) {
-        return OT_ERROR_INVALID_ARGS;
-    }
-
-    otMessage *request = otCoapNewMessage(instance, NULL);
-    if (!request) {
-        return OT_ERROR_NO_BUFS;
-    }
-
-    otCoapMessageInit(request, OT_COAP_TYPE_NON_CONFIRMABLE, OT_COAP_CODE_POST);
-    otError err = otCoapMessageAppendUriPathOptions(request, BOS_PHONEBOOK_MESH_PATH);
-    if (err == OT_ERROR_NONE) {
-        err = otCoapMessageAppendContentFormatOption(request, OT_COAP_OPTION_CONTENT_FORMAT_TEXT_PLAIN);
-    }
-    if (err == OT_ERROR_NONE) {
-        err = otCoapMessageSetPayloadMarker(request);
-    }
-    if (err == OT_ERROR_NONE) {
-        err = otMessageAppend(request, payload, (uint16_t)payload_len);
-    }
-    if (err == OT_ERROR_NONE) {
-        otMessageInfo info;
-        memset(&info, 0, sizeof(info));
-        info.mPeerAddr = *dest;
-        info.mPeerPort = OT_DEFAULT_COAP_PORT;
-        err = otCoapSendRequest(instance, request, &info, NULL, NULL);
-    }
-    if (err != OT_ERROR_NONE) {
-        otMessageFree(request);
-    }
-    return err;
-}
-
-static void phonebook_push_to_mesh(const bos_phonebook_t *book,
-                                   const char *raw,
-                                   bos_phonebook_mesh_push_t *push)
-{
-    if (!push) {
-        return;
-    }
-    memset(push, 0, sizeof(*push));
-    if (!book || !book->loaded || !raw || raw[0] == '\0') {
-        phonebook_mesh_push_set_error(push, "phonebook not loaded");
-        return;
-    }
-    if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(2000))) {
-        phonebook_mesh_push_set_error(push, "openthread lock timeout");
-        return;
-    }
-
-    otInstance *instance = esp_openthread_get_instance();
-    if (!otInstanceIsInitialized(instance)) {
-        esp_openthread_lock_release();
-        phonebook_mesh_push_set_error(push, "openthread not running");
-        return;
-    }
-    const otMeshLocalPrefix *mlp = otThreadGetMeshLocalPrefix(instance);
-    size_t payload_len = strlen(raw);
-
-    for (size_t i = 0; i < book->row_count; i++) {
-        push->attempted++;
-        proxy_addr_scope_t scope = proxy_classify_address(&book->rows[i].address, mlp);
-        if (scope != PROXY_SCOPE_MESH_LOCAL) {
-            push->bad_scope++;
-            push->failed++;
-            phonebook_mesh_push_set_error(push, "phonebook row eid is not mesh-local");
-            continue;
-        }
-
-        otError err = phonebook_emit_coap(instance, &book->rows[i].address, raw, payload_len);
-        if (err == OT_ERROR_NONE) {
-            push->sent++;
-        } else {
-            push->failed++;
-            phonebook_mesh_push_set_error(push, otThreadErrorToString(err));
-        }
-    }
-
-    esp_openthread_lock_release();
-}
-
-static esp_err_t phonebook_store_raw(const char *raw)
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(BOS_PHONEBOOK_NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        return err;
-    }
-    err = nvs_set_blob(handle, BOS_PHONEBOOK_NVS_KEY, raw, strlen(raw) + 1U);
-    if (err == ESP_OK) {
-        err = nvs_commit(handle);
-    }
-    nvs_close(handle);
-    return err;
-}
-
-static esp_err_t phonebook_load_from_nvs(void)
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(BOS_PHONEBOOK_NVS_NAMESPACE, NVS_READONLY, &handle);
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGI(TAG, "no BR phonebook stored in NVS");
-        return ESP_OK;
-    }
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    size_t len = 0;
-    err = nvs_get_blob(handle, BOS_PHONEBOOK_NVS_KEY, NULL, &len);
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        nvs_close(handle);
-        ESP_LOGI(TAG, "no BR phonebook stored in NVS");
-        return ESP_OK;
-    }
-    if (err != ESP_OK) {
-        nvs_close(handle);
-        return err;
-    }
-    if (len == 0U || len > BOS_PHONEBOOK_BODY_MAX) {
-        nvs_close(handle);
-        ESP_LOGW(TAG, "stored BR phonebook ignored: invalid size=%u", (unsigned)len);
-        return ESP_OK;
-    }
-
-    char *raw = malloc(len);
-    if (!raw) {
-        nvs_close(handle);
-        return ESP_ERR_NO_MEM;
-    }
-    err = nvs_get_blob(handle, BOS_PHONEBOOK_NVS_KEY, raw, &len);
-    nvs_close(handle);
-    if (err != ESP_OK) {
-        free(raw);
-        return err;
-    }
-    raw[len - 1U] = '\0';
-
-    /* Heap-allocated: bos_phonebook_t is ~39 KB and overflows task stacks. */
-    bos_phonebook_t *book = calloc(1, sizeof(*book));
-    if (!book) {
-        free(raw);
-        return ESP_ERR_NO_MEM;
-    }
-    char computed_digest[BOS_PHONEBOOK_DIGEST_HEX_LEN + 1];
-    char parse_error[96];
-    err = phonebook_parse_csv(raw, book, computed_digest, parse_error, sizeof(parse_error));
-    free(raw);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "stored BR phonebook ignored: %s", parse_error);
-        free(book);
-        return ESP_OK;
-    }
-    err = phonebook_apply(book);
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG,
-                 "loaded BR phonebook from NVS: version=%s digest=%s rows=%u",
-                 book->version, book->digest, (unsigned)book->row_count);
-    }
-    free(book);
-    return err;
-}
-
-static cJSON *phonebook_summary_json(const bos_phonebook_t *book)
-{
-    cJSON *phonebook = cJSON_CreateObject();
-    if (!phonebook) {
-        return NULL;
-    }
-    cJSON_AddStringToObject(phonebook, "storage", "nvs");
-    cJSON_AddBoolToObject(phonebook, "loaded", book && book->loaded);
-    cJSON_AddStringToObject(phonebook, "version", book && book->version[0] ? book->version : "");
-    cJSON_AddStringToObject(phonebook, "digest", book && book->digest[0] ? book->digest : "");
-    cJSON_AddStringToObject(phonebook, "generated_at", book && book->generated_at[0] ? book->generated_at : "");
-    cJSON_AddNumberToObject(phonebook, "row_count", book ? (double)book->row_count : 0.0);
-    cJSON_AddNumberToObject(phonebook, "columns_version", book ? (double)book->columns_version : 0.0);
-    return phonebook;
-}
-
-/* GET /bos/phonebook/floating: the BR-authored floating book (v2 14-col CSV,
- * spec section 2.1). Read-only, open-on-LAN (same boundary as /bos/status):
- * the floating channel carries no commands and the gateway polls it. Never
- * fanned out to the mesh - there is deliberately no CoAP path here. */
-static esp_err_t phonebook_floating_get_handler(httpd_req_t *req)
-{
-    char *csv = (char *)malloc(BOS_FLOATING_RENDER_MAX);
-    if (!csv) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
-        return ESP_OK;
-    }
-    int written = bos_floating_book_render_csv(csv, BOS_FLOATING_RENDER_MAX);
-    if (written < 0) {
-        free(csv);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to render floating book");
-        return ESP_OK;
-    }
-    httpd_resp_set_type(req, "text/csv");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    httpd_resp_sendstr(req, csv);
-    free(csv);
-    return ESP_OK;
-}
-
-static cJSON *phonebook_mesh_push_json(const bos_phonebook_mesh_push_t *push)
-{
-    cJSON *mesh = cJSON_CreateObject();
-    if (!mesh) {
-        return NULL;
-    }
-    cJSON_AddNumberToObject(mesh, "attempted", push ? (double)push->attempted : 0.0);
-    cJSON_AddNumberToObject(mesh, "sent", push ? (double)push->sent : 0.0);
-    cJSON_AddNumberToObject(mesh, "failed", push ? (double)push->failed : 0.0);
-    cJSON_AddNumberToObject(mesh, "bad_scope", push ? (double)push->bad_scope : 0.0);
-    if (push && push->first_error[0] != '\0') {
-        cJSON_AddStringToObject(mesh, "first_error", push->first_error);
-    }
-    return mesh;
-}
-
-static esp_err_t phonebook_post_handler(httpd_req_t *req)
-{
-    if (!bos_commissioning_request_authorized(req)) {
-        return send_unauthorized(req);
-    }
-
-    char *body = malloc(BOS_PHONEBOOK_BODY_MAX);
-    if (!body) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
-        return ESP_OK;
-    }
-    if (read_request_body(req, body, BOS_PHONEBOOK_BODY_MAX) < 0) {
-        free(body);
-        return send_status_json(req, "400 Bad Request", "empty or oversized body");
-    }
-
-    /* Heap-allocated: bos_phonebook_t is ~39 KB and overflows task stacks. */
-    bos_phonebook_t *next = calloc(1, sizeof(*next));
-    if (!next) {
-        free(body);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
-        return ESP_OK;
-    }
-    char computed_digest[BOS_PHONEBOOK_DIGEST_HEX_LEN + 1];
-    char parse_error[96];
-    esp_err_t err = phonebook_parse_csv(body, next, computed_digest, parse_error, sizeof(parse_error));
-    if (err != ESP_OK) {
-        free(body);
-        free(next);
-        return send_status_json(req, "400 Bad Request", parse_error);
-    }
-    err = phonebook_validate_push_headers(req, next, computed_digest, parse_error, sizeof(parse_error));
-    if (err != ESP_OK) {
-        free(body);
-        free(next);
-        return send_status_json(req, "400 Bad Request", parse_error);
-    }
-
-    err = phonebook_store_raw(body);
-    if (err != ESP_OK) {
-        free(body);
-        free(next);
-        ESP_LOGE(TAG, "failed to store BR phonebook in NVS: %s", esp_err_to_name(err));
-        return send_status_json(req, "500 Internal Server Error", "failed to persist phonebook");
-    }
-    err = phonebook_apply(next);
-    if (err != ESP_OK) {
-        free(body);
-        free(next);
-        ESP_LOGE(TAG, "failed to apply BR phonebook: %s", esp_err_to_name(err));
-        return send_status_json(req, "500 Internal Server Error", "failed to apply phonebook");
-    }
-    bos_phonebook_mesh_push_t mesh_push;
-    phonebook_push_to_mesh(next, body, &mesh_push);
-    free(body);
-
-    ESP_LOGI(TAG,
-             "stored BR phonebook: version=%s digest=%s generated_at=%s rows=%u mesh_sent=%u mesh_failed=%u",
-             next->version, next->digest, next->generated_at, (unsigned)next->row_count,
-             (unsigned)mesh_push.sent, (unsigned)mesh_push.failed);
-
-    cJSON *resp = cJSON_CreateObject();
-    if (!resp) {
-        free(next);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
-        return ESP_OK;
-    }
-    cJSON_AddBoolToObject(resp, "ok", true);
-    cJSON *phonebook = phonebook_summary_json(next);
-    free(next);
-    if (!phonebook) {
-        cJSON_Delete(resp);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
-        return ESP_OK;
-    }
-    cJSON_AddItemToObject(resp, "phonebook", phonebook);
-    cJSON *mesh = phonebook_mesh_push_json(&mesh_push);
-    if (!mesh) {
-        cJSON_Delete(resp);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
-        return ESP_OK;
-    }
-    cJSON_AddItemToObject(resp, "mesh_push", mesh);
-    esp_err_t ret = send_cjson(req, resp);
-    cJSON_Delete(resp);
-    return ret;
-}
-
-static bool phonebook_resolve_eui64(otInstance *instance,
-                                    const char *eui64,
-                                    proxy_target_t *out,
-                                    bool *matched_out,
-                                    proxy_addr_scope_t *scope_out)
-{
-    if (matched_out) {
-        *matched_out = false;
-    }
-    if (scope_out) {
-        *scope_out = PROXY_SCOPE_UNUSABLE;
-    }
-    if (!instance || !eui64 || !out || !s_phonebook_lock) {
-        return false;
-    }
-
-    bos_phonebook_row_t row = {0};
-    char version[BOS_PHONEBOOK_VERSION_MAX] = "";
-    bool found = false;
-    if (xSemaphoreTake(s_phonebook_lock, pdMS_TO_TICKS(200)) != pdTRUE) {
-        ESP_LOGW(TAG, "phonebook resolve %s: lock timeout", eui64);
-        return false;
-    }
-    if (s_phonebook.loaded) {
-        for (size_t i = 0; i < s_phonebook.row_count; i++) {
-            if (strcmp(s_phonebook.rows[i].eui64, eui64) == 0) {
-                row = s_phonebook.rows[i];
-                memcpy(version, s_phonebook.version, sizeof(version));
-                found = true;
-                break;
-            }
-        }
-    }
-    xSemaphoreGive(s_phonebook_lock);
-
-    if (!found) {
-        return false;
-    }
-    if (matched_out) {
-        *matched_out = true;
-    }
-
-    const otMeshLocalPrefix *mlp = otThreadGetMeshLocalPrefix(instance);
-    proxy_addr_scope_t scope = proxy_classify_address(&row.address, mlp);
-    if (scope_out) {
-        *scope_out = scope;
-    }
-    if (scope != PROXY_SCOPE_MESH_LOCAL) {
-        ESP_LOGW(TAG,
-                 "phonebook resolve %s: eid=[%s] is not mesh-local scope=%d",
-                 eui64, row.eid, (int)scope);
-        return false;
-    }
-
-    out->address = row.address;
-    out->http_port = 80;
-    ESP_LOGI(TAG,
-             "phonebook resolved trigger target: eui64=%s version=%s eid=[%s]",
-             eui64, version, row.eid);
-    return true;
 }
 
 static const char *http_status_reason(int status)
@@ -2140,12 +1110,6 @@ static const char *http_status_reason(int status)
     default:  return "Status";
     }
 }
-
-/* Shared mesh-forward machinery (defined below): resolves eui64 -> routable
- * mesh address via the BR's own SRP table, forwards over the mesh with
- * esp_http_client, streams the device response back. Used by BOTH the eui64
- * proxy (/bos/device/<eui64>/) and the spatial-id proxy (/bos/<spatial_id>/). */
-static esp_err_t proxy_forward_to_device(httpd_req_t *req, const char *eui64, const char *device_path);
 
 static esp_err_t device_proxy_handler(httpd_req_t *req)
 {
@@ -2170,11 +1134,6 @@ static esp_err_t device_proxy_handler(httpd_req_t *req)
     }
     const char *device_path = (eui_end && eui_end[0] != '\0') ? eui_end : "/";
 
-    return proxy_forward_to_device(req, eui64, device_path);
-}
-
-static esp_err_t proxy_forward_to_device(httpd_req_t *req, const char *eui64, const char *device_path)
-{
     /* Request body (PUT/POST), preserved verbatim. */
     char *body = NULL;
     int body_len = 0;
@@ -2305,87 +1264,21 @@ static esp_err_t proxy_forward_to_device(httpd_req_t *req, const char *eui64, co
 }
 
 /* ------------------------------------------------------------------------
- * GET /bos/<spatial_id>/<path...>: the position-keyed sibling of the eui64
- * device proxy. Resolves spatial_id -> eui64 from the BR's OWN operational
- * phonebook (gateway-independent at request time), then reuses the exact same
- * mesh-forward machinery as /bos/device/<eui64>/. PAIRED devices only: a
- * spatial_id exists only on an operational row (published by the gateway on
- * pairing). Unknown spatial_id -> 404; floating rows have no spatial_id so
- * they are never reachable here. The operational book must be CURRENT for this
- * to resolve - the gateway's author-and-publish-on-pairing step is the
- * load-bearing prerequisite.
- * ------------------------------------------------------------------------ */
-
-/* Scan the operational phonebook for a row whose spatial_id matches; copies its
- * eui64 into out_eui64 (17 bytes). Returns true on a paired match. */
-static bool phonebook_resolve_spatial_to_eui64(const char *spatial_id, char out_eui64[17])
-{
-    if (!spatial_id || spatial_id[0] == '\0' || !out_eui64 || !s_phonebook_lock) {
-        return false;
-    }
-    bool found = false;
-    if (xSemaphoreTake(s_phonebook_lock, pdMS_TO_TICKS(200)) != pdTRUE) {
-        ESP_LOGW(TAG, "spatial resolve %s: phonebook lock timeout", spatial_id);
-        return false;
-    }
-    if (s_phonebook.loaded) {
-        for (size_t i = 0; i < s_phonebook.row_count; i++) {
-            if (s_phonebook.rows[i].spatial_id[0] != '\0' &&
-                strcmp(s_phonebook.rows[i].spatial_id, spatial_id) == 0) {
-                memcpy(out_eui64, s_phonebook.rows[i].eui64, sizeof(s_phonebook.rows[i].eui64));
-                found = true;
-                break;
-            }
-        }
-    }
-    xSemaphoreGive(s_phonebook_lock);
-    return found;
-}
-
-static esp_err_t spatial_proxy_handler(httpd_req_t *req)
-{
-    /* Registered as a GET-only catch-all under /bos/ (after all specific /bos
-     * routes), so it only ever sees GET here: open-on-LAN, same as the eui64
-     * proxy GET. */
-    const char *prefix = "/bos/";
-    const size_t prefix_len = strlen(prefix);
-    if (strncmp(req->uri, prefix, prefix_len) != 0) {
-        return send_status_json(req, "400 Bad Request", "malformed spatial proxy uri");
-    }
-    const char *sid_start = req->uri + prefix_len;
-    const char *sid_end = strchr(sid_start, '/');
-    size_t sid_len = sid_end ? (size_t)(sid_end - sid_start) : strlen(sid_start);
-    if (sid_len == 0U || sid_len >= BOS_PHONEBOOK_SPATIAL_ID_MAX) {
-        return send_status_json(req, "404 Not Found", "unknown spatial_id");
-    }
-    char spatial_id[BOS_PHONEBOOK_SPATIAL_ID_MAX];
-    memcpy(spatial_id, sid_start, sid_len);
-    spatial_id[sid_len] = '\0';
-
-    char eui64[17];
-    if (!phonebook_resolve_spatial_to_eui64(spatial_id, eui64)) {
-        return send_status_json(req, "404 Not Found", "spatial_id not in operational phonebook");
-    }
-
-    const char *device_path = (sid_end && sid_end[0] != '\0') ? sid_end : "/";
-    ESP_LOGI(TAG, "spatial proxy: spatial_id=%s -> eui64=%s path=%s", spatial_id, eui64, device_path);
-    return proxy_forward_to_device(req, eui64, device_path);
-}
-
-/* ------------------------------------------------------------------------
  * POST /bos/trigger: the CONFORMING LAN->Thread external-trigger on-ramp
  * (platform work item B1). This is the conforming REPLACEMENT for the
  * non-conforming POST /bos/control that was stripped (it carried a
  * sender-asserted priority and shipped an arbitrary immediate effect onto
  * mesh/event - a policy bypass).
  *
- * The body is a CONFORMING external trigger envelope: source_id, the target
- * selectors, action / event_key / control_id, and parameters only. It carries
- * NO priority and NO inline command/effect. The receiving device handles it as
- * a hook/control event and firmware arbitrates priority by source/type - never
- * by a priority from the wire.
+ * The body is a CONFORMING external trigger envelope (docs/04.1 section 9,
+ * docs/02.1 "External Trigger Envelope"): source_id, the target selectors,
+ * action / event_key / control_id, and parameters only. It carries NO
+ * priority and NO inline command/effect. The device matches the envelope
+ * against its COMPILED dormant ControlEvent bindings and applies the
+ * COMPILED event's priority - never a priority from the wire. If the
+ * receiving device has no active ledger it fails closed.
  *
- * Transport: a CoAP NON-confirmable POST to coap://[<device ML-EID>]/mesh/event,
+ * Transport: a CoAP NON-confirmable POST to coap://[<device OMR>]/mesh/event,
  * Content-Format JSON, mirroring the device's own emitter
  * (firmware/.../mesh_coap.c mesh_coap_emit_control_event, the shape that
  * parse_event_envelope() reads) EXACTLY: NON+POST, AppendUriPathOptions
@@ -2394,22 +1287,21 @@ static esp_err_t spatial_proxy_handler(httpd_req_t *req)
  * otCoapStart is already called in bos_ledger_mesh_serve_init; this reuses
  * that CoAP context.
  *
- * UNICAST, not multicast: the target EUI-64 is resolved by the same SRP host
- * walk as the HTTP proxy, but with trigger-specific address ranking that
- * prefers the device's mesh-local EID/RLOC instead of the OMR address needed
- * by esp_http_client. A target that cannot be resolved to a Thread-routable
- * unicast address is a clear 4xx; the BR does NOT fall back to multicast.
- * spatial_id->EUI-64 resolution is a site-server responsibility (group
- * selectors resolved before Thread fan-out, docs/09.2 "Runtime Control Over
- * Thread"); the device-facing BR call is unicast-by-address resolved from the
- * durable EUI-64.
+ * UNICAST, not multicast: the target EUI-64 is resolved to the device's
+ * routable mesh-local/OMR address via the same SRP host walk the /bos/device
+ * proxy uses (proxy_resolve_eui64). The device CoAP server listens on that
+ * address (otCoapAddResource binds all of the device's CoAP addresses). A
+ * target that cannot be resolved to a unicast address is a clear 4xx; the BR
+ * does NOT fall back to multicast. spatial_id->EUI-64 resolution is a
+ * site-server responsibility (group selectors resolved before Thread
+ * fan-out, docs/09.2 "Runtime Control Over Thread"); the device-facing BR
+ * call is unicast-by-address resolved from the durable EUI-64.
  *
  * Auth: token-gated, same trust anchor as the other /bos write routes
  * (bos_commissioning_request_authorized).
  * ------------------------------------------------------------------------ */
 #define BOS_TRIGGER_BODY_MAX 1024
 #define BOS_TRIGGER_PATH_EVENT "mesh/event"
-#define BOS_TRIGGER_SOURCE_ID_MAX 96
 
 /* Build the conforming mesh/event envelope from the validated request fields.
  * Mirrors the device emitter field set (mesh_event_emit.c): source_id
@@ -2476,10 +1368,10 @@ static char *trigger_build_envelope(const cJSON *req_root,
         }
     }
 
-    /* parameters: echoed verbatim. They are hook parameters, not a raw
-     * priority/effect payload. The receiver decides whether and how they map
-     * into a local control event; the C6 hook path reads level_milli
-     * (0..1000) / level (0..100). */
+    /* parameters: echoed verbatim. It is event-parameter context, not a raw
+     * effect payload - the device only honours it if a compiled dormant
+     * external control event and its capability contract accept it. The device
+     * reads parameters.level_milli (0..1000) / parameters.level (0..100). */
     const cJSON *params = cJSON_GetObjectItemCaseSensitive(req_root, "parameters");
     if (cJSON_IsObject(params)) {
         cJSON *p_out = cJSON_Duplicate(params, true);
@@ -2565,13 +1457,6 @@ static esp_err_t trigger_post_handler(httpd_req_t *req)
         cJSON_Delete(root);
         return send_status_json(req, "400 Bad Request", "source_id is required");
     }
-    char source_id[BOS_TRIGGER_SOURCE_ID_MAX];
-    size_t source_id_len = strlen(source_j->valuestring);
-    if (source_id_len >= sizeof(source_id)) {
-        cJSON_Delete(root);
-        return send_status_json(req, "400 Bad Request", "source_id too long");
-    }
-    memcpy(source_id, source_j->valuestring, source_id_len + 1);
 
     /* The wire must NOT assert priority. Reject loudly rather than silently
      * dropping it - a sender attempting to claim authority is a contract
@@ -2583,10 +1468,9 @@ static esp_err_t trigger_post_handler(httpd_req_t *req)
     }
 
     /* Unicast target resolution. The BR resolves by durable EUI-64 via the SRP
-     * host walk, using the trigger-specific mesh-local address selection.
-     * spatial_id alone cannot be resolved to a unicast address here - that is
-     * a site-server responsibility - so it is a clear 4xx, never a multicast
-     * fallback. */
+     * host walk (the same path /bos/device uses). spatial_id alone cannot be
+     * resolved to a unicast address here - that is a site-server
+     * responsibility - so it is a clear 4xx, never a multicast fallback. */
     const cJSON *target = cJSON_GetObjectItemCaseSensitive(root, "target");
     const cJSON *eui_j = cJSON_IsObject(target)
                              ? cJSON_GetObjectItemCaseSensitive(target, "eui64")
@@ -2605,7 +1489,7 @@ static esp_err_t trigger_post_handler(httpd_req_t *req)
 
     /* Build the conforming envelope before taking the OT lock. */
     cJSON *echo = NULL;
-    char *payload = trigger_build_envelope(root, source_id, &echo);
+    char *payload = trigger_build_envelope(root, source_j->valuestring, &echo);
     cJSON_Delete(root);
     if (!payload) {
         cJSON_Delete(echo);
@@ -2614,13 +1498,10 @@ static esp_err_t trigger_post_handler(httpd_req_t *req)
     }
     size_t payload_len = strlen(payload);
 
-    /* Resolve + emit under the held OT lock. The BR phonebook is the primary
-     * logical EUI-64 -> ML-EID map; SRP remains a mesh-local diagnostic
-     * fallback only. */
+    /* Resolve + emit under the held OT lock (proxy_resolve_eui64 walks the SRP
+     * table; trigger_emit_coap reuses the CoAP context started in
+     * bos_ledger_mesh_serve_init). */
     proxy_target_t tgt = {.http_port = 80};
-    const char *resolver = "";
-    bool phonebook_matched = false;
-    bool phonebook_bad_scope = false;
     if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(2000))) {
         cJSON_free(payload);
         cJSON_Delete(echo);
@@ -2633,21 +1514,7 @@ static esp_err_t trigger_post_handler(httpd_req_t *req)
         cJSON_Delete(echo);
         return thread_diag_send_unavailable(req, "openthread not running");
     }
-    bool resolved = phonebook_resolve_eui64(instance, eui64, &tgt, &phonebook_matched, NULL);
-    if (resolved) {
-        resolver = "phonebook";
-    } else if (phonebook_matched) {
-        phonebook_bad_scope = true;
-    } else {
-        proxy_addr_scope_t srp_scope = PROXY_SCOPE_UNUSABLE;
-        resolved = trigger_resolve_eui64(instance, eui64, &tgt, &srp_scope);
-        if (resolved) {
-            resolver = "srp_mesh_local_fallback";
-            ESP_LOGW(TAG,
-                     "trigger resolve %s: phonebook miss, using SRP ML-EID fallback",
-                     eui64);
-        }
-    }
+    bool resolved = proxy_resolve_eui64(instance, eui64, &tgt);
     otError emit_err = OT_ERROR_NONE;
     if (resolved) {
         emit_err = trigger_emit_coap(instance, &tgt.address, payload, payload_len);
@@ -2656,15 +1523,10 @@ static esp_err_t trigger_post_handler(httpd_req_t *req)
 
     cJSON_free(payload);
 
-    if (phonebook_bad_scope) {
-        cJSON_Delete(echo);
-        return send_status_json(req, "409 Conflict",
-                                "phonebook eid for target.eui64 is not mesh-local");
-    }
     if (!resolved) {
         cJSON_Delete(echo);
         return send_status_json(req, "404 Not Found",
-                                "device not found in phonebook or SRP with mesh-local EID");
+                                "device not found in SRP registrations");
     }
 
     char dest_str[OT_IP6_ADDRESS_STRING_SIZE];
@@ -2679,8 +1541,8 @@ static esp_err_t trigger_post_handler(httpd_req_t *req)
     }
 
     ESP_LOGI(TAG,
-             "trigger envelope emitted: src=%s eui64=%s resolver=%s dest=[%s] uri=%s len=%u",
-             source_id, eui64, resolver, dest_str, BOS_TRIGGER_PATH_EVENT,
+             "trigger envelope emitted: src=%s eui64=%s dest=[%s] uri=%s len=%u",
+             source_j->valuestring, eui64, dest_str, BOS_TRIGGER_PATH_EVENT,
              (unsigned)payload_len);
 
     cJSON *resp = cJSON_CreateObject();
@@ -2691,7 +1553,6 @@ static esp_err_t trigger_post_handler(httpd_req_t *req)
     }
     cJSON_AddBoolToObject(resp, "ok", true);
     cJSON_AddBoolToObject(resp, "emitted", true);
-    cJSON_AddStringToObject(resp, "resolver", resolver);
     cJSON_AddStringToObject(resp, "uri", BOS_TRIGGER_PATH_EVENT);
     cJSON_AddStringToObject(resp, "dest", dest_str);
     if (echo) {
@@ -2751,12 +1612,6 @@ esp_err_t bos_diagnostics_server_start(void)
 {
     if (s_registered) {
         return ESP_OK;
-    }
-
-    if (!s_phonebook_lock) {
-        s_phonebook_lock = xSemaphoreCreateMutex();
-        ESP_RETURN_ON_FALSE(s_phonebook_lock != NULL, ESP_ERR_NO_MEM, TAG, "failed to create phonebook lock");
-        ESP_RETURN_ON_ERROR(phonebook_load_from_nvs(), TAG, "failed to load BR phonebook from NVS");
     }
 
     ESP_RETURN_ON_ERROR(bos_br_ota_init(), TAG, "failed to initialize BR OTA routes");
@@ -2898,14 +1753,6 @@ esp_err_t bos_diagnostics_server_start(void)
         .handler = thread_reset_post_handler,
         .user_ctx = NULL,
     };
-    /* Confirm-gated identity reset: erase the NVS device_id override so boot
-     * re-derives the EUI-64 id; token-authed, 428 plan without confirm. */
-    httpd_uri_t device_id_reset_uri = {
-        .uri = "/bos/device-id/reset",
-        .method = HTTP_POST,
-        .handler = device_id_reset_post_handler,
-        .user_ctx = NULL,
-    };
     /* Device-UI proxy. Wildcard URIs (the server runs httpd_uri_match_wildcard);
      * these register BEFORE the upstream catch-all slash-star GET handler
      * because external handlers are stored here at init and flushed to httpd
@@ -2929,22 +1776,6 @@ esp_err_t bos_diagnostics_server_start(void)
         .handler = device_proxy_handler,
         .user_ctx = NULL,
     };
-    /* Token-authed BR phonebook ingest: versioned v3 (18-col) CSV, header
-     * eui64,device_id,device_class,make,model,model_id,sku,fw,rated_power_w,
-     * rated_lumens,cct,discovered_at,eid,x,y,z,spatial_id,tags. */
-    httpd_uri_t phonebook_post_uri = {
-        .uri = "/bos/phonebook",
-        .method = HTTP_POST,
-        .handler = phonebook_post_handler,
-        .user_ctx = NULL,
-    };
-    /* Read-only floating book for the gateway (BR-authored touch log). */
-    httpd_uri_t phonebook_floating_get_uri = {
-        .uri = "/bos/phonebook/floating",
-        .method = HTTP_GET,
-        .handler = phonebook_floating_get_handler,
-        .user_ctx = NULL,
-    };
     /* Conforming LAN->Thread external-trigger on-ramp (B1): token-authed,
      * emits a no-priority trigger envelope as a CoAP NON POST to the target
      * device's mesh/event. */
@@ -2952,17 +1783,6 @@ esp_err_t bos_diagnostics_server_start(void)
         .uri = "/bos/trigger",
         .method = HTTP_POST,
         .handler = trigger_post_handler,
-        .user_ctx = NULL,
-    };
-    /* Position-keyed device proxy: GET /bos/<spatial_id>/<path...>. Wildcard
-     * "/bos/" catch-all, registered LAST so every specific /bos route above
-     * (status, ledger, device proxy, phonebook, trigger, ...) matches first;
-     * only an unclaimed /bos/<segment>/ falls through here to the spatial
-     * resolve. GET only. */
-    httpd_uri_t spatial_proxy_get_uri = {
-        .uri = "/bos/*",
-        .method = HTTP_GET,
-        .handler = spatial_proxy_handler,
         .user_ctx = NULL,
     };
 
@@ -2983,22 +1803,19 @@ esp_err_t bos_diagnostics_server_start(void)
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&ota_confirm_uri), TAG, "failed to register /bos/ota/confirm");
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&ota_rollback_uri), TAG, "failed to register /bos/ota/rollback");
     /* Route-slot budget (esp_br_web.c BOS_EXTERNAL_HANDLER_MAX; route 17 past
-     * the old cap of 16 broke the 0.1.4 OTA): this function now performs 28
-     * registrations after adding GET /bos/<spatial_id>/ proxy. The cap is
-     * raised to 28 in esp_br_web.c with zero spare external slots. */
+     * the old cap of 16 broke the 0.1.4 OTA): this function now performs 24
+     * registrations (the prior 23 plus POST /bos/trigger). The cap is 24 in
+     * esp_br_web.c, so the external slots are now FULL with zero margin; the
+     * next new route MUST raise BOS_EXTERNAL_HANDLER_MAX before adding its
+     * registration here. */
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&radio_get_uri), TAG, "failed to register GET /bos/radio");
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&radio_post_uri), TAG, "failed to register POST /bos/radio");
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&thread_neighbors_uri), TAG, "failed to register /bos/thread-neighbors");
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&thread_reset_uri), TAG, "failed to register /bos/thread-reset");
-    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&device_id_reset_uri), TAG, "failed to register /bos/device-id/reset");
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&device_proxy_get_uri), TAG, "failed to register GET /bos/device/*");
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&device_proxy_put_uri), TAG, "failed to register PUT /bos/device/*");
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&device_proxy_post_uri), TAG, "failed to register POST /bos/device/*");
-    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&phonebook_post_uri), TAG, "failed to register POST /bos/phonebook");
-    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&phonebook_floating_get_uri), TAG, "failed to register GET /bos/phonebook/floating");
     ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&trigger_post_uri), TAG, "failed to register POST /bos/trigger");
-    /* MUST be the last /bos route registered (wildcard catch-all). */
-    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&spatial_proxy_get_uri), TAG, "failed to register GET /bos/<spatial_id>/*");
 
     s_registered = true;
     esp_err_t confirm_err = bos_br_ota_confirm_running_app();
