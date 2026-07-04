@@ -5,16 +5,19 @@
 #include "bos_ledger_mesh_serve.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "bos_convergence_aggregator.h"
 #include "bos_ledger_ingress.h"
+#include "bos_mesh_announce.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_openthread.h"
 #include "esp_openthread_lock.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "openthread/coap.h"
 #include "openthread/dns.h"
 #include "openthread/error.h"
@@ -32,6 +35,27 @@ static const char *TAG = "bos_mesh_serve";
 #define BOS_LEDGER_BLOCK_SZX OT_COAP_OPTION_BLOCK_SZX_256
 #define BOS_MESH_SERVICE_NAME "_mesh._udp"
 #define BOS_MESH_SRP_TXT_ENTRY_COUNT 7U
+#define BOS_PHONEBOOK_DIGEST_HEX_LEN 64
+
+/* Held metadata for the active operational phonebook TARGET reported in
+ * GET /mesh/have. The BR is NOT the phonebook byte seed: nodes leech the book
+ * over TMFS from a peer (existing PUSH seeds the first nodes; node-to-node
+ * gossip spreads it viral). This target only tells a polling node "a newer
+ * phonebook version exists" so its pull/gossip wakes. Guarded because the CoAP
+ * have handler runs on the OT task while publish runs on the httpd task. */
+static SemaphoreHandle_t s_pb_lock;
+static bool s_pb_present;
+static uint32_t s_pb_version;
+static char s_pb_digest[BOS_PHONEBOOK_DIGEST_HEX_LEN + 1];
+static uint32_t s_pb_bytes_total;
+static uint32_t s_pb_chunk_count;
+
+static void ensure_pb_lock(void)
+{
+    if (!s_pb_lock) {
+        s_pb_lock = xSemaphoreCreateMutex();
+    }
+}
 
 static bool s_started;
 #if CONFIG_OPENTHREAD_SRP_CLIENT
@@ -460,10 +484,37 @@ static void handle_have(void *context, otMessage *message, const otMessageInfo *
         snprintf(peers_json, sizeof(peers_json), "[]");
     }
 
+    // Phonebook availability target, sibling of the ledger target. A polling
+    // node reads this to learn a newer BR phonebook version exists, then wakes
+    // its own pull/gossip and leeches the book over TMFS from a peer. The BR
+    // does not serve the phonebook bytes here (no BR phonebook chunk/peer list
+    // today - see report), so no phonebook peers[] is emitted.
+    char pb_block[224];
+    ensure_pb_lock();
+    if (s_pb_lock && xSemaphoreTake(s_pb_lock, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        if (s_pb_present) {
+            snprintf(pb_block,
+                     sizeof(pb_block),
+                     "\"phonebook\":{\"artifact_class\":\"phonebook\",\"version\":%u,"
+                     "\"digest\":\"%s\",\"chunk_size\":%u,\"chunk_count\":%u,"
+                     "\"bytes_total\":%u}",
+                     (unsigned)s_pb_version,
+                     s_pb_digest,
+                     (unsigned)BOS_MESH_CHUNK_SIZE,
+                     (unsigned)s_pb_chunk_count,
+                     (unsigned)s_pb_bytes_total);
+        } else {
+            snprintf(pb_block, sizeof(pb_block), "\"phonebook\":null");
+        }
+        xSemaphoreGive(s_pb_lock);
+    } else {
+        snprintf(pb_block, sizeof(pb_block), "\"phonebook\":null");
+    }
+
     bos_ledger_active_t active;
     bool active_ok = bos_ledger_ingress_get_active(&active) == ESP_OK && active.present;
 
-    char json[1152];
+    char json[1408];
     int len;
     if (active_ok) {
         char digest[BOS_LEDGER_DIGEST_LEN * 2 + 1];
@@ -473,7 +524,7 @@ static void handle_have(void *context, otMessage *message, const otMessageInfo *
                        "{\"artifact_class\":\"ledger\",\"have\":%u,\"chunk_count\":%u,"
                        "\"target\":{\"ledger_version\":%u,\"manifest_digest\":\"%s\","
                        "\"chunk_size\":%u,\"chunks_total\":%u,\"bytes_total\":%u},"
-                       "\"peers\":%s,\"source\":\"br-bootstrap\",\"state\":\"%s\"}",
+                       "%s,\"peers\":%s,\"source\":\"br-bootstrap\",\"state\":\"%s\"}",
                        (unsigned)active.chunk_count,
                        (unsigned)active.chunk_count,
                        (unsigned)active.version,
@@ -481,6 +532,7 @@ static void handle_have(void *context, otMessage *message, const otMessageInfo *
                        (unsigned)active.chunk_size,
                        (unsigned)active.chunk_count,
                        (unsigned)active.size_bytes,
+                       pb_block,
                        peers_json,
                        ledger_state_string(bos_ledger_ingress_state()));
     } else {
@@ -489,8 +541,9 @@ static void handle_have(void *context, otMessage *message, const otMessageInfo *
                        "{\"artifact_class\":\"ledger\",\"have\":0,\"chunk_count\":0,"
                        "\"target\":{\"ledger_version\":null,\"manifest_digest\":null,"
                        "\"chunk_size\":%u,\"chunks_total\":0,\"bytes_total\":0},"
-                       "\"peers\":%s,\"source\":\"br-bootstrap\",\"state\":\"%s\"}",
+                       "%s,\"peers\":%s,\"source\":\"br-bootstrap\",\"state\":\"%s\"}",
                        (unsigned)BOS_LEDGER_CHUNK_SIZE,
+                       pb_block,
                        peers_json,
                        ledger_state_string(bos_ledger_ingress_state()));
     }
@@ -584,6 +637,78 @@ esp_err_t bos_ledger_mesh_serve_publish_active(uint32_t version, const uint8_t *
     ESP_LOGW(TAG, "SRP client disabled; cannot publish mesh seed for ledger version=%u", (unsigned)version);
     return ESP_ERR_NOT_SUPPORTED;
 #endif
+}
+
+esp_err_t bos_ledger_mesh_serve_announce_ledger(uint32_t version, const uint8_t *digest_first_4)
+{
+    if (!digest_first_4) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    // Refresh the SRP lv/ld advertisement for the freshly-deployed ledger, then
+    // nudge the live mesh so nodes poll /mesh/have and pull now instead of on
+    // their next backoff cycle. The nudge carries no authority: each node still
+    // version-compares and pulls through the existing manifest/chunk path.
+    esp_err_t ret = bos_ledger_mesh_serve_publish_active(version, digest_first_4);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "ledger deploy SRP refresh failed: %s", esp_err_to_name(ret));
+    }
+    char prefix[9];
+    digest_prefix_hex(digest_first_4, prefix);
+    esp_err_t announced = bos_mesh_announce_fire("ledger", version, prefix);
+    if (announced != ESP_OK) {
+        ESP_LOGW(TAG, "ledger deploy announce nudge failed: %s", esp_err_to_name(announced));
+        if (ret == ESP_OK) {
+            ret = announced;
+        }
+    }
+    return ret;
+}
+
+esp_err_t bos_ledger_mesh_serve_publish_phonebook(const char *raw,
+                                                  size_t len,
+                                                  const char *version_str,
+                                                  const char *digest_hex64,
+                                                  bool announce)
+{
+    (void)raw; // The BR reports the phonebook TARGET only; it does not seed the
+               // bytes (PUSH + node-to-node TMFS gossip carry the document).
+    if (!version_str || !digest_hex64 || len == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint32_t version = (uint32_t)strtoul(version_str, NULL, 10);
+
+    ensure_pb_lock();
+    if (s_pb_lock) {
+        xSemaphoreTake(s_pb_lock, portMAX_DELAY);
+    }
+    s_pb_present = true;
+    s_pb_version = version;
+    snprintf(s_pb_digest, sizeof(s_pb_digest), "%s", digest_hex64);
+    s_pb_bytes_total = (uint32_t)len;
+    s_pb_chunk_count = (uint32_t)((len + BOS_MESH_CHUNK_SIZE - 1U) / BOS_MESH_CHUNK_SIZE);
+    if (s_pb_lock) {
+        xSemaphoreGive(s_pb_lock);
+    }
+
+    ESP_LOGI(TAG,
+             "phonebook mesh target updated: v%u digest=%.8s bytes=%u chunks=%u announce=%d",
+             (unsigned)version,
+             digest_hex64,
+             (unsigned)len,
+             (unsigned)s_pb_chunk_count,
+             (int)announce);
+
+    if (announce) {
+        char prefix[9];
+        snprintf(prefix, sizeof(prefix), "%.8s", digest_hex64);
+        esp_err_t announced = bos_mesh_announce_fire("phonebook", version, prefix);
+        if (announced != ESP_OK) {
+            ESP_LOGW(TAG, "phonebook announce nudge failed: %s", esp_err_to_name(announced));
+            return announced;
+        }
+    }
+    return ESP_OK;
 }
 
 int bos_ledger_mesh_serve_torrent_json(char *out, size_t out_len)

@@ -9,6 +9,7 @@ idf_component_register(
         bos_convergence_aggregator
         bos_floating_book
         bos_ledger_ingress
+        bos_ledger_mesh_serve
         bos_server_registration
         bos_thread_dataset_anchor
         bos_thread_diag

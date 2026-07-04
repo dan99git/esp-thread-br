@@ -34,7 +34,8 @@ CONFIG_APP_PROJECT_VER_FROM_CONFIG=y
 # 0.1.20: confirm-gated POST /bos/device-id/reset - erases the NVS bos_reg/device_id override so boot re-derives the EUI-64 id (2026-07-02)
 # 0.1.21: device-id reset also erases bos_reg/device_token so the BR re-claims under the new id (0.1.20 kept the old token: no re-claim, heartbeats 404) (2026-07-02)
 # 0.1.22: phonebook v3 (17-col, model_id + rated_power_w/rated_lumens/cct), floating book parses SRP rpw/rl/cct + reports them to convergence, operational book v3-only (v2/v1 reject), new GET /bos/<spatial_id>/* reverse proxy (2026-07-04)
-CONFIG_APP_PROJECT_VER="0.1.22"
+# 0.1.23: torrent-lite BR distribution side - /mesh/have now carries a phonebook TARGET (version/digest/bytes) alongside the ledger target; new bos_mesh_announce fires a mesh-wide nudge (coap://[ff03::1]/mesh/announce) on a fresh phonebook ingest (POST /bos/phonebook) AND a fresh ledger deploy (POST /bos/ledger/push) so nodes pull now; phonebook PUSH preserved (additive) (2026-07-04)
+CONFIG_APP_PROJECT_VER="0.1.23"
 
 # HTTP server for upstream BR diagnostics and Building OS /bos/ endpoints.
 CONFIG_HTTPD_WS_SUPPORT=y

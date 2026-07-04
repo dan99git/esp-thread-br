@@ -1,0 +1,9 @@
+idf_component_register(
+    SRCS
+        "bos_mesh_announce.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        freertos
+        openthread
+)

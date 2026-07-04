@@ -6,6 +6,7 @@ idf_component_register(
     REQUIRES
         bos_convergence_aggregator
         bos_ledger_ingress
+        bos_mesh_announce
         esp_partition
         freertos
         openthread

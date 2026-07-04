@@ -19,6 +19,7 @@
 #include "bos_thread_diag.h"
 #include "bos_br_ota.h"
 #include "bos_ledger_ingress.h"
+#include "bos_ledger_mesh_serve.h"
 #include "bos_server_registration.h"
 #include "cJSON.h"
 #include "esp_br_web.h"
@@ -333,7 +334,30 @@ static esp_err_t ledger_active_get_handler(httpd_req_t *req)
 
 static esp_err_t ledger_push_handler(httpd_req_t *req)
 {
-    return bos_ledger_ingress_http_push(req);
+    /* Snapshot the active ledger before the push so we can tell whether this
+     * deploy actually installed a new version/digest. */
+    bos_ledger_active_t before;
+    bool had_before = (bos_ledger_ingress_get_active(&before) == ESP_OK && before.present);
+
+    esp_err_t ret = bos_ledger_ingress_http_push(req);
+
+    /* On a genuine new ledger, refresh the SRP advertisement and nudge the live
+     * mesh so nodes pull now instead of on their next poll (symmetric with the
+     * phonebook announce). PUSH/pull authority is unchanged: the nudge only
+     * wakes the node's existing version-compare + pull. */
+    bos_ledger_active_t after;
+    if (bos_ledger_ingress_get_active(&after) == ESP_OK && after.present) {
+        bool changed = !had_before ||
+                       after.version != before.version ||
+                       memcmp(after.digest, before.digest, sizeof(after.digest)) != 0;
+        if (changed) {
+            esp_err_t announced = bos_ledger_mesh_serve_announce_ledger(after.version, after.digest);
+            if (announced != ESP_OK) {
+                ESP_LOGW(TAG, "ledger deploy announce failed: %s", esp_err_to_name(announced));
+            }
+        }
+    }
+    return ret;
 }
 
 static esp_err_t ledger_torrent_get_handler(httpd_req_t *req)
@@ -1900,6 +1924,15 @@ static esp_err_t phonebook_load_from_nvs(void)
     char computed_digest[BOS_PHONEBOOK_DIGEST_HEX_LEN + 1];
     char parse_error[96];
     err = phonebook_parse_csv(raw, book, computed_digest, parse_error, sizeof(parse_error));
+    if (err == ESP_OK) {
+        /* Advertise the stored phonebook version in the /mesh/have target on
+         * boot. announce=false: a re-energised node self-heals via its own
+         * boot-time neighbour compare, so the BR does not nudge at boot. */
+        esp_err_t seed = bos_ledger_mesh_serve_publish_phonebook(raw, strlen(raw), book->version, book->digest, false);
+        if (seed != ESP_OK) {
+            ESP_LOGW(TAG, "phonebook mesh target seed (boot) failed: %s", esp_err_to_name(seed));
+        }
+    }
     free(raw);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "stored BR phonebook ignored: %s", parse_error);
@@ -2027,6 +2060,15 @@ static esp_err_t phonebook_post_handler(httpd_req_t *req)
     }
     bos_phonebook_mesh_push_t mesh_push;
     phonebook_push_to_mesh(next, body, &mesh_push);
+
+    /* Additive to the PUSH above (not a replacement): advertise the new version
+     * in the /mesh/have phonebook target and nudge the live mesh so nodes that
+     * already have an older book wake their pull/gossip and leech the new one
+     * viral. announce=true only on this fresh gateway ingest. */
+    esp_err_t seed = bos_ledger_mesh_serve_publish_phonebook(body, strlen(body), next->version, next->digest, true);
+    if (seed != ESP_OK) {
+        ESP_LOGE(TAG, "phonebook mesh target/announce failed: %s", esp_err_to_name(seed));
+    }
     free(body);
 
     ESP_LOGI(TAG,
