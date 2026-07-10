@@ -13,8 +13,11 @@ dependencies:
     path: ../../common/thread_border_router
   protocol_examples_common:
     path: ${IDF_PATH}/examples/common_components/protocol_examples_common
+  # LOOP A 2026-06-13: installed IDF v5.5 does not ship ot_examples_common at
+  # the pinned ${IDF_PATH} path. Reuse the same local helper the
+  # building_os_border_router example builds against, so host code stays stock.
   ot_examples_common:
-    path: ${IDF_PATH}/examples/openthread/ot_common_components/ot_examples_common
+    path: ../../building_os_border_router/local_helpers/ot_examples_common
 
   ## Required IDF version
   idf:

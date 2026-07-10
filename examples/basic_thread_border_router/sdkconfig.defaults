@@ -114,3 +114,28 @@ CONFIG_EXAMPLE_ETH_PHY_ADDR=1
 # http server
 #
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+#
+# LOOP A stock-vs-fork test delta (2026-06-13).
+# Replicates ONLY the Ethernet-backbone + W5500 SPI and RCP UART/reset
+# settings from ../building_os_border_router/sdkconfig.defaults.
+# Stock requires OPENTHREAD_BR_AUTO_START=y for the Ethernet backbone
+# (compile-time #error in main/esp_ot_br.c otherwise).
+#
+CONFIG_OPENTHREAD_BR_AUTO_START=y
+# CLI off, matching the fork (fork sets OPENTHREAD_CLI=n). Also required
+# because installed IDF v5.5 lacks ot_examples_common's ot_console_start();
+# the header-only local helper is used instead (see main/idf_component.yml).
+CONFIG_OPENTHREAD_CLI=n
+CONFIG_OPENTHREAD_CLI_OTA=n
+CONFIG_EXAMPLE_CONNECT_WIFI=n
+CONFIG_EXAMPLE_CONNECT_ETHERNET=y
+CONFIG_EXAMPLE_CONNECT_IPV4=y
+CONFIG_EXAMPLE_CONNECT_IPV6=y
+CONFIG_ETH_USE_SPI_ETHERNET=y
+CONFIG_ETH_SPI_ETHERNET_W5500=y
+CONFIG_ESP_BR_H2_TARGET=y
+CONFIG_PIN_TO_RCP_RESET=7
+CONFIG_PIN_TO_RCP_BOOT=8
+CONFIG_PIN_TO_RCP_TX=17
+CONFIG_PIN_TO_RCP_RX=18

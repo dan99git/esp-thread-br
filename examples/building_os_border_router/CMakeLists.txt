@@ -53,11 +53,26 @@ if(EXISTS "${BOS_BR_ESP_OPENTHREAD_HEADER}")
     endif()
 endif()
 
+# Building OS shared firmware component library
+# (docs/08.2-base-firmware-architecture.md section 7): individual shared
+# components are appended by RELATIVE path (never the whole shared-components
+# directory, so the bench-only sdmmc shadow is not pulled in). This keeps the
+# fork mergeable against espressif/esp-thread-br upstream - the only
+# fork-facing change is additive lines in this example CMakeLists.txt.
+set(BOS_BR_SHARED_COMPONENTS_PATH "${CMAKE_SOURCE_DIR}/../../../../shared-components")
+if(NOT IS_DIRECTORY "${BOS_BR_SHARED_COMPONENTS_PATH}/bos_thread_diag")
+    message(FATAL_ERROR
+        "Building OS shared component bos_thread_diag missing at "
+        "${BOS_BR_SHARED_COMPONENTS_PATH}/bos_thread_diag.\n"
+        "Build this example from the vendor/esp-thread-br checkout inside the building-os repository.")
+endif()
+
 list(APPEND EXTRA_COMPONENT_DIRS
     "${BOS_BR_VENDOR_PATH}/components"
     "${BOS_BR_THREAD_BORDER_ROUTER_PATH}"
     "${BOS_BR_PROTOCOL_EXAMPLES_PATH}"
     "${BOS_BR_OT_EXAMPLES_COMMON_COMPONENT}"
+    "${BOS_BR_SHARED_COMPONENTS_PATH}/bos_thread_diag"
     "${CMAKE_SOURCE_DIR}/components")
 
 if(BOS_BR_NEEDS_OPENTHREAD_START_COMPAT)

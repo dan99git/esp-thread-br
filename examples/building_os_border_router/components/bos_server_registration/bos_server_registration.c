@@ -7,8 +7,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
+#include "bos_time.h"
 #include "cJSON.h"
+#include "mdns.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
@@ -18,6 +21,7 @@
 #include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "protocol_examples_common.h"
 #include "sdkconfig.h"
 
 #include "freertos/FreeRTOS.h"
@@ -67,6 +71,24 @@ static char s_server_url[BOS_REG_URL_MAX];
 static char s_device_id[BOS_REG_DEVICE_ID_MAX];
 static char s_backbone_ipv4[16];
 static char s_backbone_ipv6[40];
+
+/* Gateway discovery via mDNS browse of _bos-server._tcp (the gateway
+ * self-advertises it: host/runtime/server/src/mdns-advertiser.ts). The
+ * discovered URL is used for ALL server requests; the NVS/Kconfig
+ * server_url is fallback only, when browse yields nothing (spec
+ * docs/scratch/phonebook-v2-two-book-spec.md section 6; decision note
+ * jobs/26-06-26/br-server-feed-ip-independence-2026-06-26.md). Repeated
+ * send failures trigger a re-browse so a gateway IP change re-resolves.
+ * Never written to NVS. */
+#define BOS_REG_MDNS_SERVICE "_bos-server"
+#define BOS_REG_MDNS_PROTO "_tcp"
+#define BOS_REG_MDNS_BROWSE_TIMEOUT_MS 3000
+#define BOS_REG_MDNS_BROWSE_MAX_RESULTS 8
+#define BOS_REG_REBROWSE_FAILURE_THRESHOLD 3
+
+static portMUX_TYPE s_url_mux = portMUX_INITIALIZER_UNLOCKED;
+static char s_mdns_url[BOS_REG_URL_MAX];
+static uint32_t s_consecutive_send_failures;
 
 /* CONFIG_NEWLIB_NANO_FORMAT has no 64-bit printf support; %llu misaligns the
  * variadic args (LoadProhibited panic). Format u64 manually instead (same
@@ -132,36 +154,89 @@ static esp_err_t load_server_url(void)
     return s_server_url[0] != '\0' ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
-static esp_err_t load_device_id(void)
+/* Same 16-lowercase-hex EUI-64 format as the LC
+ * (firmware/xiao-esp32c6/components/thread_runtime/thread_runtime_identity.c
+ * thread_runtime_identity_format_eui64). */
+static void format_eui64_hex(char out[17], const uint8_t eui64[8])
 {
-    esp_err_t err = nvs_get_string(BOS_REG_KEY_DEVICE_ID, s_device_id, sizeof(s_device_id));
-    if (err == ESP_OK && s_device_id[0] != '\0') {
+    snprintf(out,
+             17,
+             "%02x%02x%02x%02x%02x%02x%02x%02x",
+             eui64[0],
+             eui64[1],
+             eui64[2],
+             eui64[3],
+             eui64[4],
+             eui64[5],
+             eui64[6],
+             eui64[7]);
+}
+
+/* EUI-64 device identity (spec docs/scratch/phonebook-v2-two-book-spec.md
+ * section 6): mirror the LC fill_eui64 (thread_runtime.c, ESP_MAC_IEEE802154)
+ * first. On this BR host (ESP32-S3, SOC_IEEE802154_SUPPORTED not set) the
+ * IEEE802154 MAC type is not in the esp_mac table and esp_read_mac fails, so
+ * fall back to the standard EUI-48 -> EUI-64 expansion of the base MAC
+ * (insert ff:fe, the same fffe-elision convention already coded into the
+ * BR's proxy_normalise_eui64 and the C6 efuse MAC_EXT default). */
+static esp_err_t fill_device_eui64(char out[17])
+{
+    uint8_t eui64[8] = {0};
+    if (esp_read_mac(eui64, ESP_MAC_IEEE802154) == ESP_OK) {
+        format_eui64_hex(out, eui64);
         return ESP_OK;
     }
 
     uint8_t mac[6];
-    err = esp_read_mac(mac, ESP_MAC_ETH);
+    esp_err_t err = esp_read_mac(mac, ESP_MAC_ETH);
     if (err != ESP_OK) {
         err = esp_read_mac(mac, ESP_MAC_WIFI_STA);
     }
     if (err != ESP_OK) {
         return err;
     }
+    eui64[0] = mac[0];
+    eui64[1] = mac[1];
+    eui64[2] = mac[2];
+    eui64[3] = 0xff;
+    eui64[4] = 0xfe;
+    eui64[5] = mac[3];
+    eui64[6] = mac[4];
+    eui64[7] = mac[5];
+    format_eui64_hex(out, eui64);
+    return ESP_OK;
+}
 
-    snprintf(s_device_id,
-             sizeof(s_device_id),
-             "%02x:%02x:%02x:%02x:%02x:%02x",
-             mac[0],
-             mac[1],
-             mac[2],
-             mac[3],
-             mac[4],
-             mac[5]);
+static esp_err_t load_device_id(void)
+{
+    /* NVS override first (unchanged behaviour); derived EUI-64 otherwise,
+     * replacing the previous colon-separated MAC-format defect. */
+    esp_err_t err = nvs_get_string(BOS_REG_KEY_DEVICE_ID, s_device_id, sizeof(s_device_id));
+    if (err == ESP_OK && s_device_id[0] != '\0') {
+        return ESP_OK;
+    }
+
+    char eui64[17];
+    err = fill_device_eui64(eui64);
+    if (err != ESP_OK) {
+        return err;
+    }
+    snprintf(s_device_id, sizeof(s_device_id), "%s", eui64);
     return nvs_set_string(BOS_REG_KEY_DEVICE_ID, s_device_id);
 }
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
+    /* Gateway time fallback (spec section 5 source #2): the gateway has no
+     * time endpoint (host/runtime/server/src exposes only /api/health), so
+     * the HTTP Date header on every gateway response is the documented
+     * interim source. bos_time applies it only while SNTP has not synced. */
+    if (evt->event_id == HTTP_EVENT_ON_HEADER && evt->header_key && evt->header_value &&
+        strcasecmp(evt->header_key, "Date") == 0) {
+        bos_time_note_http_date(evt->header_value);
+        return ESP_OK;
+    }
+
     if (evt->event_id != HTTP_EVENT_ON_DATA || evt->data_len <= 0 || evt->user_data == NULL) {
         return ESP_OK;
     }
@@ -177,15 +252,128 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
+/* Diagnosis fix (br-diagnosis.md finding #5): prefer the backbone IPv4 for
+ * registration; only fall back to IPv6 when it is a backbone ULA/global
+ * address (s_backbone_ipv6 is only ever populated with one, see
+ * ip_event_handler). Previously any IPv6 event - including Thread-side or
+ * link-local - could win and the site server would point at a non-routable
+ * address: BR on the LAN but invisible to the server. */
 static const char *registration_address(void)
 {
-    if (s_backbone_ipv6[0] != '\0') {
-        return s_backbone_ipv6;
-    }
     if (s_backbone_ipv4[0] != '\0') {
         return s_backbone_ipv4;
     }
+    if (s_backbone_ipv6[0] != '\0') {
+        return s_backbone_ipv6;
+    }
     return "";
+}
+
+static void set_mdns_url(const char *url)
+{
+    taskENTER_CRITICAL(&s_url_mux);
+    snprintf(s_mdns_url, sizeof(s_mdns_url), "%s", url ? url : "");
+    taskEXIT_CRITICAL(&s_url_mux);
+}
+
+/* Copies the active server base URL: mDNS-discovered when present, else the
+ * NVS/Kconfig fallback. Returns false when neither is available. */
+static bool active_server_url(char *out, size_t out_len)
+{
+    taskENTER_CRITICAL(&s_url_mux);
+    snprintf(out, out_len, "%s", s_mdns_url);
+    taskEXIT_CRITICAL(&s_url_mux);
+    if (out[0] != '\0') {
+        return true;
+    }
+    snprintf(out, out_len, "%s", s_server_url);
+    return out[0] != '\0';
+}
+
+/* One mDNS browse pass for _bos-server._tcp. Takes the first result carrying
+ * an IPv4 address and a port and builds "http://<ip>:<port>". Returns true
+ * when a URL was discovered and stored. */
+static bool discover_gateway_mdns(void)
+{
+    mdns_result_t *results = NULL;
+    esp_err_t err = mdns_query_ptr(BOS_REG_MDNS_SERVICE,
+                                   BOS_REG_MDNS_PROTO,
+                                   BOS_REG_MDNS_BROWSE_TIMEOUT_MS,
+                                   BOS_REG_MDNS_BROWSE_MAX_RESULTS,
+                                   &results);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mDNS browse %s.%s failed: %s",
+                 BOS_REG_MDNS_SERVICE, BOS_REG_MDNS_PROTO, esp_err_to_name(err));
+        return false;
+    }
+    if (results == NULL) {
+        ESP_LOGD(TAG, "mDNS browse %s.%s: no results", BOS_REG_MDNS_SERVICE, BOS_REG_MDNS_PROTO);
+        return false;
+    }
+
+    bool found = false;
+    for (mdns_result_t *r = results; r != NULL && !found; r = r->next) {
+        if (r->port == 0U) {
+            continue;
+        }
+        for (mdns_ip_addr_t *a = r->addr; a != NULL; a = a->next) {
+            if (a->addr.type != ESP_IPADDR_TYPE_V4) {
+                continue;
+            }
+            char url[BOS_REG_URL_MAX];
+            int written = snprintf(url,
+                                   sizeof(url),
+                                   "http://" IPSTR ":%u",
+                                   IP2STR(&a->addr.u_addr.ip4),
+                                   (unsigned)r->port);
+            if (written < 0 || written >= (int)sizeof(url)) {
+                continue;
+            }
+            set_mdns_url(url);
+            ESP_LOGI(TAG, "gateway discovered via mDNS: %s (instance=%s)",
+                     url, r->instance_name ? r->instance_name : "");
+            found = true;
+            break;
+        }
+    }
+    mdns_query_results_free(results);
+    return found;
+}
+
+/* Browse when nothing is discovered yet or after repeated send failures
+ * (gateway IP change re-resolves). Called from the registration task only. */
+static void refresh_gateway_discovery(void)
+{
+    char current[BOS_REG_URL_MAX];
+    taskENTER_CRITICAL(&s_url_mux);
+    snprintf(current, sizeof(current), "%s", s_mdns_url);
+    uint32_t failures = s_consecutive_send_failures;
+    taskEXIT_CRITICAL(&s_url_mux);
+
+    if (current[0] != '\0' && failures < BOS_REG_REBROWSE_FAILURE_THRESHOLD) {
+        return;
+    }
+    if (discover_gateway_mdns()) {
+        taskENTER_CRITICAL(&s_url_mux);
+        s_consecutive_send_failures = 0;
+        taskEXIT_CRITICAL(&s_url_mux);
+    } else if (current[0] != '\0' && failures >= BOS_REG_REBROWSE_FAILURE_THRESHOLD) {
+        /* The previously discovered gateway stopped answering the browse:
+         * drop the stale URL so the NVS/Kconfig fallback applies. */
+        ESP_LOGW(TAG, "gateway mDNS re-browse yielded nothing; falling back to configured URL");
+        set_mdns_url("");
+    }
+}
+
+static void note_send_result(esp_err_t err)
+{
+    taskENTER_CRITICAL(&s_url_mux);
+    if (err == ESP_OK) {
+        s_consecutive_send_failures = 0;
+    } else if (s_consecutive_send_failures < UINT32_MAX) {
+        s_consecutive_send_failures++;
+    }
+    taskEXIT_CRITICAL(&s_url_mux);
 }
 
 static esp_err_t set_auth_headers(esp_http_client_handle_t client, bool include_device_token)
@@ -218,8 +406,13 @@ static esp_err_t perform_json_request(const char *method,
                                       bool include_device_token,
                                       bos_http_response_t *response)
 {
+    char base_url[BOS_REG_URL_MAX];
+    if (!active_server_url(base_url, sizeof(base_url))) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
     char url[BOS_REG_REQUEST_URL_MAX];
-    int written = snprintf(url, sizeof(url), "%s%s", s_server_url, path);
+    int written = snprintf(url, sizeof(url), "%s%s", base_url, path);
     if (written < 0 || written >= (int)sizeof(url)) {
         return ESP_ERR_INVALID_SIZE;
     }
@@ -253,8 +446,12 @@ static esp_err_t perform_json_request(const char *method,
     esp_http_client_cleanup(client);
 
     if (err != ESP_OK) {
+        /* Transport-level failure: counts toward the re-browse threshold
+         * (an HTTP status from the server proves the URL still reaches it). */
+        note_send_result(err);
         return err;
     }
+    note_send_result(ESP_OK);
     if (status < 200 || status >= 300) {
         ESP_LOGW(TAG, "%s %s returned HTTP %d: %s", method, path, status, response->data);
         return ESP_FAIL;
@@ -321,7 +518,9 @@ static esp_err_t register_with_server(void)
         return err;
     }
 
-    ESP_LOGI(TAG, "registered border router %s with BOS server %s", s_device_id, s_server_url);
+    char base_url[BOS_REG_URL_MAX] = "";
+    (void)active_server_url(base_url, sizeof(base_url));
+    ESP_LOGI(TAG, "registered border router %s with BOS server %s", s_device_id, base_url);
     return ESP_OK;
 }
 
@@ -485,10 +684,9 @@ static void registration_task(void *arg)
     (void)arg;
 
     if (load_server_url() != ESP_OK) {
-        ESP_LOGW(TAG, "no BOS server URL configured; registration disabled");
-        s_task_started = false;
-        vTaskDelete(NULL);
-        return;
+        /* No longer fatal: mDNS browse is the primary discovery path and the
+         * NVS/Kconfig URL is fallback only (spec section 6). */
+        ESP_LOGW(TAG, "no NVS/Kconfig BOS server URL; relying on mDNS gateway discovery");
     }
 
     if (load_device_id() != ESP_OK) {
@@ -500,6 +698,15 @@ static void registration_task(void *arg)
 
     while (true) {
         xEventGroupWaitBits(s_events, BOS_REG_READY_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
+
+        refresh_gateway_discovery();
+
+        char base_url[BOS_REG_URL_MAX];
+        if (!active_server_url(base_url, sizeof(base_url))) {
+            ESP_LOGW(TAG, "no gateway URL (mDNS empty, no fallback); retrying browse");
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            continue;
+        }
 
         if (!bos_server_registration_is_registered()) {
             esp_err_t err = register_with_server();
@@ -517,6 +724,30 @@ static void registration_task(void *arg)
     }
 }
 
+/* Mirrors is_backbone_netif() in bos_diagnostics_server.c: only the
+ * protocol_examples_common backbone interface counts (br-diagnosis.md
+ * finding #5 - the old handler accepted ANY IPv6 event, including the
+ * OpenThread netif's). */
+static bool is_backbone_netif(esp_netif_t *netif)
+{
+    const char *desc = esp_netif_get_desc(netif);
+    if (!desc) {
+        return false;
+    }
+
+#if CONFIG_EXAMPLE_CONNECT_ETHERNET
+    if (strcmp(desc, EXAMPLE_NETIF_DESC_ETH) == 0) {
+        return true;
+    }
+#endif
+#if CONFIG_EXAMPLE_CONNECT_WIFI
+    if (strcmp(desc, EXAMPLE_NETIF_DESC_STA) == 0) {
+        return true;
+    }
+#endif
+    return false;
+}
+
 static void ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     (void)arg;
@@ -530,6 +761,15 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
         xEventGroupSetBits(s_events, BOS_REG_READY_BIT);
     } else if (event_id == IP_EVENT_GOT_IP6) {
         ip_event_got_ip6_t *event = (ip_event_got_ip6_t *)event_data;
+        if (!is_backbone_netif(event->esp_netif)) {
+            return;
+        }
+        esp_ip6_addr_type_t addr_type = esp_netif_ip6_get_addr_type(&event->ip6_info.ip);
+        if (addr_type != ESP_IP6_ADDR_IS_UNIQUE_LOCAL && addr_type != ESP_IP6_ADDR_IS_GLOBAL) {
+            /* Link-local and other scopes are not LAN-routable registration
+             * addresses; ignore them (the server could not reach us there). */
+            return;
+        }
         snprintf(s_backbone_ipv6,
                  sizeof(s_backbone_ipv6),
                  IPV6STR,
@@ -619,9 +859,13 @@ esp_err_t bos_server_registration_get_server_url(char *out, size_t out_len)
     if (out == NULL || out_len == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (load_server_url() != ESP_OK || s_server_url[0] == '\0') {
+    /* Reports the URL actually in use: mDNS-discovered when present, else
+     * the NVS/Kconfig fallback. */
+    (void)load_server_url();
+    char base_url[BOS_REG_URL_MAX];
+    if (!active_server_url(base_url, sizeof(base_url))) {
         return ESP_ERR_NOT_FOUND;
     }
-    int written = snprintf(out, out_len, "%s", s_server_url);
+    int written = snprintf(out, out_len, "%s", base_url);
     return written < 0 || written >= (int)out_len ? ESP_ERR_INVALID_SIZE : ESP_OK;
 }

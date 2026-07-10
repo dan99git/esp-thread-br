@@ -18,6 +18,8 @@ set(requires
     esp_ot_cli_extension
     thread_border_router
     bos_server_registration
+    bos_time
+    bos_floating_book
     bos_ledger_ingress
     bos_ledger_mesh_serve
     bos_convergence_aggregator

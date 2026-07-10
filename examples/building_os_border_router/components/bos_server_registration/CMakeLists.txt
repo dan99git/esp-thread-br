@@ -5,6 +5,7 @@ idf_component_register(
         "include"
     REQUIRES
         bos_convergence_aggregator
+        bos_time
         esp_event
         esp_http_client
         esp_netif
@@ -12,4 +13,5 @@ idf_component_register(
         json
         mdns
         nvs_flash
+        protocol_examples_common
 )
