@@ -1,6 +1,9 @@
 idf_component_register(
     SRCS
         "bos_convergence_aggregator.c"
+        "bos_agg_json_util.c"
+        "bos_agg_peer_table.c"
+        "bos_agg_scan.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
