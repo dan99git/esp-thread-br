@@ -1,6 +1,8 @@
 idf_component_register(
     SRCS
         "bos_server_registration.c"
+        "bos_server_reg_transport.c"
+        "bos_server_reg_heartbeat.c"
     INCLUDE_DIRS
         "include"
     REQUIRES

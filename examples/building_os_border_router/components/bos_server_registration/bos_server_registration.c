@@ -1,24 +1,24 @@
 /**
  * Building OS Border Router: site server registration and heartbeat.
+ *
+ * HTTP transport + gateway mDNS discovery live in bos_server_reg_transport.c;
+ * the heartbeat RAM ring lives in bos_server_reg_heartbeat.c (shared
+ * internals: bos_server_reg_internal.h).
  */
 
 #include "bos_server_registration.h"
+#include "bos_server_reg_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 
-#include "bos_time.h"
 #include "cJSON.h"
-#include "mdns.h"
 #include "esp_err.h"
 #include "esp_event.h"
-#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
-#include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "protocol_examples_common.h"
@@ -33,126 +33,12 @@
 static const char *TAG = "bos_reg";
 
 #define BOS_REG_READY_BIT BIT0
-#define BOS_REG_RESPONSE_MAX 2048
-#define BOS_REG_CONVERGENCE_JSON_MAX 12288
-#define BOS_REG_URL_MAX 160
-#define BOS_REG_REQUEST_URL_MAX 320
-#define BOS_REG_DEVICE_ID_MAX 64
-#define BOS_REG_TOKEN_MAX 96
-
-typedef struct {
-    char data[BOS_REG_RESPONSE_MAX];
-    int len;
-} bos_http_response_t;
-
-/* Heartbeat buffer (docs/08.8-border-router.md s12): while the site server
- * is unreachable, heartbeats are buffered in RAM, capped at
- * BOS_REG_HEARTBEAT_BUFFER_CAP entries; on overflow the oldest entry is
- * dropped and counted. The ring is flushed oldest-first on the next
- * successful server contact, before the live heartbeat. RAM-only by design
- * (the docs say "in memory"); lost on reboot, which keeps the boot-relative
- * recorded_uptime_ms timestamps coherent. Entries are only mutated on the
- * registration task; the spinlock guards the count/drop counters read by
- * the diagnostics handler on the httpd task. */
-typedef struct {
-    uint64_t recorded_uptime_ms;
-    bool online;
-} bos_heartbeat_entry_t;
-
-static portMUX_TYPE s_hb_mux = portMUX_INITIALIZER_UNLOCKED;
-static bos_heartbeat_entry_t s_hb_buffer[BOS_REG_HEARTBEAT_BUFFER_CAP];
-static size_t s_hb_head;     /* index of oldest entry */
-static size_t s_hb_count;
-static uint32_t s_hb_dropped;
 
 static EventGroupHandle_t s_events;
 static bool s_task_started;
-static char s_server_url[BOS_REG_URL_MAX];
-static char s_device_id[BOS_REG_DEVICE_ID_MAX];
+char bos_reg_device_id[BOS_REG_DEVICE_ID_MAX];
 static char s_backbone_ipv4[16];
 static char s_backbone_ipv6[40];
-
-/* Gateway discovery via mDNS browse of _bos-server._tcp (the gateway
- * self-advertises it: host/runtime/server/src/mdns-advertiser.ts). The
- * discovered URL is used for ALL server requests; the NVS/Kconfig
- * server_url is fallback only, when browse yields nothing (spec
- * docs/scratch/phonebook-v2-two-book-spec.md section 6; decision note
- * jobs/26-06-26/br-server-feed-ip-independence-2026-06-26.md). Repeated
- * send failures trigger a re-browse so a gateway IP change re-resolves.
- * Never written to NVS. */
-#define BOS_REG_MDNS_SERVICE "_bos-server"
-#define BOS_REG_MDNS_PROTO "_tcp"
-#define BOS_REG_MDNS_BROWSE_TIMEOUT_MS 3000
-#define BOS_REG_MDNS_BROWSE_MAX_RESULTS 8
-#define BOS_REG_REBROWSE_FAILURE_THRESHOLD 3
-
-static portMUX_TYPE s_url_mux = portMUX_INITIALIZER_UNLOCKED;
-static char s_mdns_url[BOS_REG_URL_MAX];
-static uint32_t s_consecutive_send_failures;
-
-/* CONFIG_NEWLIB_NANO_FORMAT has no 64-bit printf support; %llu misaligns the
- * variadic args (LoadProhibited panic). Format u64 manually instead (same
- * helper as bos_diagnostics_server.c). */
-static void u64_to_dec(uint64_t value, char out[21])
-{
-    char tmp[21];
-    size_t i = 0;
-    do {
-        tmp[i++] = (char)('0' + (value % 10ULL));
-        value /= 10ULL;
-    } while (value != 0 && i < sizeof(tmp) - 1);
-    size_t n = 0;
-    while (i > 0) {
-        out[n++] = tmp[--i];
-    }
-    out[n] = '\0';
-}
-
-static esp_err_t nvs_get_string(const char *key, char *out, size_t out_len)
-{
-    nvs_handle_t h;
-    esp_err_t err = nvs_open(BOS_REG_NVS_NAMESPACE, NVS_READONLY, &h);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    size_t len = out_len;
-    err = nvs_get_str(h, key, out, &len);
-    nvs_close(h);
-    return err;
-}
-
-static esp_err_t nvs_set_string(const char *key, const char *value)
-{
-    nvs_handle_t h;
-    esp_err_t err = nvs_open(BOS_REG_NVS_NAMESPACE, NVS_READWRITE, &h);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = nvs_set_str(h, key, value);
-    if (err == ESP_OK) {
-        err = nvs_commit(h);
-    }
-    nvs_close(h);
-    return err;
-}
-
-static esp_err_t load_server_url(void)
-{
-    esp_err_t err = nvs_get_string(BOS_REG_KEY_SERVER_URL, s_server_url, sizeof(s_server_url));
-    if (err == ESP_OK && s_server_url[0] != '\0') {
-        return ESP_OK;
-    }
-
-#ifdef CONFIG_BOS_SERVER_DEFAULT_URL
-    snprintf(s_server_url, sizeof(s_server_url), "%s", CONFIG_BOS_SERVER_DEFAULT_URL);
-#else
-    s_server_url[0] = '\0';
-#endif
-
-    return s_server_url[0] != '\0' ? ESP_OK : ESP_ERR_NOT_FOUND;
-}
 
 /* Same 16-lowercase-hex EUI-64 format as the LC
  * (firmware/xiao-esp32c6/components/thread_runtime/thread_runtime_identity.c
@@ -211,8 +97,8 @@ static esp_err_t load_device_id(void)
 {
     /* NVS override first (unchanged behaviour); derived EUI-64 otherwise,
      * replacing the previous colon-separated MAC-format defect. */
-    esp_err_t err = nvs_get_string(BOS_REG_KEY_DEVICE_ID, s_device_id, sizeof(s_device_id));
-    if (err == ESP_OK && s_device_id[0] != '\0') {
+    esp_err_t err = nvs_get_string(BOS_REG_KEY_DEVICE_ID, bos_reg_device_id, sizeof(bos_reg_device_id));
+    if (err == ESP_OK && bos_reg_device_id[0] != '\0') {
         return ESP_OK;
     }
 
@@ -221,35 +107,8 @@ static esp_err_t load_device_id(void)
     if (err != ESP_OK) {
         return err;
     }
-    snprintf(s_device_id, sizeof(s_device_id), "%s", eui64);
-    return nvs_set_string(BOS_REG_KEY_DEVICE_ID, s_device_id);
-}
-
-static esp_err_t http_event_handler(esp_http_client_event_t *evt)
-{
-    /* Gateway time fallback (spec section 5 source #2): the gateway has no
-     * time endpoint (host/runtime/server/src exposes only /api/health), so
-     * the HTTP Date header on every gateway response is the documented
-     * interim source. bos_time applies it only while SNTP has not synced. */
-    if (evt->event_id == HTTP_EVENT_ON_HEADER && evt->header_key && evt->header_value &&
-        strcasecmp(evt->header_key, "Date") == 0) {
-        bos_time_note_http_date(evt->header_value);
-        return ESP_OK;
-    }
-
-    if (evt->event_id != HTTP_EVENT_ON_DATA || evt->data_len <= 0 || evt->user_data == NULL) {
-        return ESP_OK;
-    }
-
-    bos_http_response_t *response = (bos_http_response_t *)evt->user_data;
-    int remaining = (int)sizeof(response->data) - response->len - 1;
-    int copy_len = evt->data_len < remaining ? evt->data_len : remaining;
-    if (copy_len > 0) {
-        memcpy(response->data + response->len, evt->data, copy_len);
-        response->len += copy_len;
-        response->data[response->len] = '\0';
-    }
-    return ESP_OK;
+    snprintf(bos_reg_device_id, sizeof(bos_reg_device_id), "%s", eui64);
+    return nvs_set_string(BOS_REG_KEY_DEVICE_ID, bos_reg_device_id);
 }
 
 /* Diagnosis fix (br-diagnosis.md finding #5): prefer the backbone IPv4 for
@@ -267,196 +126,6 @@ static const char *registration_address(void)
         return s_backbone_ipv6;
     }
     return "";
-}
-
-static void set_mdns_url(const char *url)
-{
-    taskENTER_CRITICAL(&s_url_mux);
-    snprintf(s_mdns_url, sizeof(s_mdns_url), "%s", url ? url : "");
-    taskEXIT_CRITICAL(&s_url_mux);
-}
-
-/* Copies the active server base URL: mDNS-discovered when present, else the
- * NVS/Kconfig fallback. Returns false when neither is available. */
-static bool active_server_url(char *out, size_t out_len)
-{
-    taskENTER_CRITICAL(&s_url_mux);
-    snprintf(out, out_len, "%s", s_mdns_url);
-    taskEXIT_CRITICAL(&s_url_mux);
-    if (out[0] != '\0') {
-        return true;
-    }
-    snprintf(out, out_len, "%s", s_server_url);
-    return out[0] != '\0';
-}
-
-/* One mDNS browse pass for _bos-server._tcp. Takes the first result carrying
- * an IPv4 address and a port and builds "http://<ip>:<port>". Returns true
- * when a URL was discovered and stored. */
-static bool discover_gateway_mdns(void)
-{
-    mdns_result_t *results = NULL;
-    esp_err_t err = mdns_query_ptr(BOS_REG_MDNS_SERVICE,
-                                   BOS_REG_MDNS_PROTO,
-                                   BOS_REG_MDNS_BROWSE_TIMEOUT_MS,
-                                   BOS_REG_MDNS_BROWSE_MAX_RESULTS,
-                                   &results);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "mDNS browse %s.%s failed: %s",
-                 BOS_REG_MDNS_SERVICE, BOS_REG_MDNS_PROTO, esp_err_to_name(err));
-        return false;
-    }
-    if (results == NULL) {
-        ESP_LOGD(TAG, "mDNS browse %s.%s: no results", BOS_REG_MDNS_SERVICE, BOS_REG_MDNS_PROTO);
-        return false;
-    }
-
-    bool found = false;
-    for (mdns_result_t *r = results; r != NULL && !found; r = r->next) {
-        if (r->port == 0U) {
-            continue;
-        }
-        for (mdns_ip_addr_t *a = r->addr; a != NULL; a = a->next) {
-            if (a->addr.type != ESP_IPADDR_TYPE_V4) {
-                continue;
-            }
-            char url[BOS_REG_URL_MAX];
-            int written = snprintf(url,
-                                   sizeof(url),
-                                   "http://" IPSTR ":%u",
-                                   IP2STR(&a->addr.u_addr.ip4),
-                                   (unsigned)r->port);
-            if (written < 0 || written >= (int)sizeof(url)) {
-                continue;
-            }
-            set_mdns_url(url);
-            ESP_LOGI(TAG, "gateway discovered via mDNS: %s (instance=%s)",
-                     url, r->instance_name ? r->instance_name : "");
-            found = true;
-            break;
-        }
-    }
-    mdns_query_results_free(results);
-    return found;
-}
-
-/* Browse when nothing is discovered yet or after repeated send failures
- * (gateway IP change re-resolves). Called from the registration task only. */
-static void refresh_gateway_discovery(void)
-{
-    char current[BOS_REG_URL_MAX];
-    taskENTER_CRITICAL(&s_url_mux);
-    snprintf(current, sizeof(current), "%s", s_mdns_url);
-    uint32_t failures = s_consecutive_send_failures;
-    taskEXIT_CRITICAL(&s_url_mux);
-
-    if (current[0] != '\0' && failures < BOS_REG_REBROWSE_FAILURE_THRESHOLD) {
-        return;
-    }
-    if (discover_gateway_mdns()) {
-        taskENTER_CRITICAL(&s_url_mux);
-        s_consecutive_send_failures = 0;
-        taskEXIT_CRITICAL(&s_url_mux);
-    } else if (current[0] != '\0' && failures >= BOS_REG_REBROWSE_FAILURE_THRESHOLD) {
-        /* The previously discovered gateway stopped answering the browse:
-         * drop the stale URL so the NVS/Kconfig fallback applies. */
-        ESP_LOGW(TAG, "gateway mDNS re-browse yielded nothing; falling back to configured URL");
-        set_mdns_url("");
-    }
-}
-
-static void note_send_result(esp_err_t err)
-{
-    taskENTER_CRITICAL(&s_url_mux);
-    if (err == ESP_OK) {
-        s_consecutive_send_failures = 0;
-    } else if (s_consecutive_send_failures < UINT32_MAX) {
-        s_consecutive_send_failures++;
-    }
-    taskEXIT_CRITICAL(&s_url_mux);
-}
-
-static esp_err_t set_auth_headers(esp_http_client_handle_t client, bool include_device_token)
-{
-#ifdef CONFIG_BOS_SERVER_API_KEY
-    if (CONFIG_BOS_SERVER_API_KEY[0] != '\0') {
-        esp_err_t err = esp_http_client_set_header(client, "x-api-key", CONFIG_BOS_SERVER_API_KEY);
-        if (err != ESP_OK) {
-            return err;
-        }
-    }
-#endif
-
-    if (!include_device_token) {
-        return ESP_OK;
-    }
-
-    char token[BOS_REG_TOKEN_MAX];
-    esp_err_t err = bos_server_registration_get_token(token, sizeof(token));
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    return esp_http_client_set_header(client, "X-Device-Token", token);
-}
-
-static esp_err_t perform_json_request(const char *method,
-                                      const char *path,
-                                      const char *body,
-                                      bool include_device_token,
-                                      bos_http_response_t *response)
-{
-    char base_url[BOS_REG_URL_MAX];
-    if (!active_server_url(base_url, sizeof(base_url))) {
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    char url[BOS_REG_REQUEST_URL_MAX];
-    int written = snprintf(url, sizeof(url), "%s%s", base_url, path);
-    if (written < 0 || written >= (int)sizeof(url)) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    esp_http_client_config_t config = {
-        .url = url,
-        .method = strcmp(method, "PUT") == 0 ? HTTP_METHOD_PUT : HTTP_METHOD_POST,
-        .timeout_ms = 5000,
-        .event_handler = http_event_handler,
-        .user_data = response,
-    };
-
-    response->len = 0;
-    response->data[0] = '\0';
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_err_t err = set_auth_headers(client, include_device_token);
-    if (err != ESP_OK) {
-        esp_http_client_cleanup(client);
-        return err;
-    }
-    esp_http_client_set_post_field(client, body, strlen(body));
-
-    err = esp_http_client_perform(client);
-    int status = esp_http_client_get_status_code(client);
-    esp_http_client_cleanup(client);
-
-    if (err != ESP_OK) {
-        /* Transport-level failure: counts toward the re-browse threshold
-         * (an HTTP status from the server proves the URL still reaches it). */
-        note_send_result(err);
-        return err;
-    }
-    note_send_result(ESP_OK);
-    if (status < 200 || status >= 300) {
-        ESP_LOGW(TAG, "%s %s returned HTTP %d: %s", method, path, status, response->data);
-        return ESP_FAIL;
-    }
-    return ESP_OK;
 }
 
 static esp_err_t persist_registration_response(const char *json)
@@ -480,7 +149,7 @@ static esp_err_t persist_registration_response(const char *json)
         if (cJSON_IsString(device_id) && device_id->valuestring && device_id->valuestring[0] != '\0') {
             err = nvs_set_string(BOS_REG_KEY_DEVICE_ID, device_id->valuestring);
             if (err == ESP_OK) {
-                snprintf(s_device_id, sizeof(s_device_id), "%s", device_id->valuestring);
+                snprintf(bos_reg_device_id, sizeof(bos_reg_device_id), "%s", device_id->valuestring);
             }
         }
     }
@@ -500,7 +169,7 @@ static esp_err_t register_with_server(void)
                            "\"capabilities\":{\"thread_address\":\"%s\",\"http_port\":%u,"
                            "\"space\":\"infrastructure\",\"upstream\":\"ethernet\","
                            "\"role\":\"border-router\"}}",
-                           s_device_id,
+                           bos_reg_device_id,
                            registration_address(),
                            80U);
     if (written < 0 || written >= (int)sizeof(body)) {
@@ -520,7 +189,7 @@ static esp_err_t register_with_server(void)
 
     char base_url[BOS_REG_URL_MAX] = "";
     (void)active_server_url(base_url, sizeof(base_url));
-    ESP_LOGI(TAG, "registered border router %s with BOS server %s", s_device_id, base_url);
+    ESP_LOGI(TAG, "registered border router %s with BOS server %s", bos_reg_device_id, base_url);
     return ESP_OK;
 }
 
@@ -530,101 +199,12 @@ static esp_err_t send_heartbeat(void)
     char body[] = "{\"online\":true}";
     bos_http_response_t response;
 
-    int written = snprintf(path, sizeof(path), "/api/devices/%s/status", s_device_id);
+    int written = snprintf(path, sizeof(path), "/api/devices/%s/status", bos_reg_device_id);
     if (written < 0 || written >= (int)sizeof(path)) {
         return ESP_ERR_INVALID_SIZE;
     }
 
     return perform_json_request("PUT", path, body, true, &response);
-}
-
-/* Appends the heartbeat that just failed to send to the RAM ring. On
- * overflow the oldest entry is dropped and counted. */
-static void buffer_heartbeat(void)
-{
-    bos_heartbeat_entry_t entry = {
-        .recorded_uptime_ms = (uint64_t)(esp_timer_get_time() / 1000ULL),
-        .online = true,
-    };
-
-    taskENTER_CRITICAL(&s_hb_mux);
-    if (s_hb_count == BOS_REG_HEARTBEAT_BUFFER_CAP) {
-        s_hb_head = (s_hb_head + 1U) % BOS_REG_HEARTBEAT_BUFFER_CAP;
-        s_hb_count--;
-        s_hb_dropped++;
-    }
-    s_hb_buffer[(s_hb_head + s_hb_count) % BOS_REG_HEARTBEAT_BUFFER_CAP] = entry;
-    s_hb_count++;
-    taskEXIT_CRITICAL(&s_hb_mux);
-}
-
-/* Replays one buffered heartbeat: the fields the live heartbeat sends plus
- * the boot-relative capture timestamp and its age at flush time, so the
- * server can place the missed heartbeat in wall-clock time from its own
- * receive timestamp. The status route reads only "online"; extra fields
- * are ignored. */
-static esp_err_t send_buffered_heartbeat(const bos_heartbeat_entry_t *entry)
-{
-    char path[96];
-    char body[160];
-    char recorded_str[21];
-    char age_str[21];
-    bos_http_response_t response;
-
-    uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
-    u64_to_dec(entry->recorded_uptime_ms, recorded_str);
-    u64_to_dec(now_ms > entry->recorded_uptime_ms ? now_ms - entry->recorded_uptime_ms : 0ULL, age_str);
-
-    int written = snprintf(path, sizeof(path), "/api/devices/%s/status", s_device_id);
-    if (written < 0 || written >= (int)sizeof(path)) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    written = snprintf(body,
-                       sizeof(body),
-                       "{\"online\":%s,\"buffered\":true,\"recorded_uptime_ms\":%s,\"age_ms\":%s}",
-                       entry->online ? "true" : "false",
-                       recorded_str,
-                       age_str);
-    if (written < 0 || written >= (int)sizeof(body)) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    return perform_json_request("PUT", path, body, true, &response);
-}
-
-/* Drains the ring oldest-first. Stops at the first send failure, leaving
- * the unsent tail (plus anything newer) buffered. ESP_OK when the ring is
- * empty. Entries are popped only after a successful send. */
-static esp_err_t flush_heartbeat_buffer(void)
-{
-    while (true) {
-        bos_heartbeat_entry_t entry = {0};
-        size_t count_before;
-
-        taskENTER_CRITICAL(&s_hb_mux);
-        count_before = s_hb_count;
-        if (count_before > 0) {
-            entry = s_hb_buffer[s_hb_head];
-        }
-        taskEXIT_CRITICAL(&s_hb_mux);
-
-        if (count_before == 0) {
-            return ESP_OK;
-        }
-
-        esp_err_t err = send_buffered_heartbeat(&entry);
-        if (err != ESP_OK) {
-            return err;
-        }
-
-        taskENTER_CRITICAL(&s_hb_mux);
-        if (s_hb_count > 0) {
-            s_hb_head = (s_hb_head + 1U) % BOS_REG_HEARTBEAT_BUFFER_CAP;
-            s_hb_count--;
-        }
-        taskEXIT_CRITICAL(&s_hb_mux);
-    }
 }
 
 static esp_err_t send_convergence(void)
@@ -642,7 +222,7 @@ static esp_err_t send_convergence(void)
         return ESP_FAIL;
     }
 
-    int written = snprintf(path, sizeof(path), "/api/border-routers/%s/convergence", s_device_id);
+    int written = snprintf(path, sizeof(path), "/api/border-routers/%s/convergence", bos_reg_device_id);
     if (written < 0 || written >= (int)sizeof(path)) {
         free(body);
         return ESP_ERR_INVALID_SIZE;
@@ -832,26 +412,11 @@ esp_err_t bos_server_registration_get_device_id(char *out, size_t out_len)
     if (out == NULL || out_len == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (load_device_id() != ESP_OK || s_device_id[0] == '\0') {
+    if (load_device_id() != ESP_OK || bos_reg_device_id[0] == '\0') {
         return ESP_ERR_NOT_FOUND;
     }
-    int written = snprintf(out, out_len, "%s", s_device_id);
+    int written = snprintf(out, out_len, "%s", bos_reg_device_id);
     return written < 0 || written >= (int)out_len ? ESP_ERR_INVALID_SIZE : ESP_OK;
-}
-
-void bos_server_registration_heartbeat_stats(uint32_t *buffered_count, uint32_t *dropped_count)
-{
-    taskENTER_CRITICAL(&s_hb_mux);
-    uint32_t buffered = (uint32_t)s_hb_count;
-    uint32_t dropped = s_hb_dropped;
-    taskEXIT_CRITICAL(&s_hb_mux);
-
-    if (buffered_count != NULL) {
-        *buffered_count = buffered;
-    }
-    if (dropped_count != NULL) {
-        *dropped_count = dropped;
-    }
 }
 
 esp_err_t bos_server_registration_get_server_url(char *out, size_t out_len)
