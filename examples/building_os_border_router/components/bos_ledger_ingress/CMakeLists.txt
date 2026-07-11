@@ -1,6 +1,8 @@
 idf_component_register(
     SRCS
         "bos_ledger_ingress.c"
+        "bos_ledger_ingress_cbor.c"
+        "bos_ledger_ingress_push.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
