@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "bos_br_ota.c"
+        "bos_br_ota_stream.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
