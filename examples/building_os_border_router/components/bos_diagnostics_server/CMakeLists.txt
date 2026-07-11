@@ -1,6 +1,13 @@
 idf_component_register(
     SRCS
         "bos_diagnostics_server.c"
+        "bos_diag_http_util.c"
+        "bos_diag_routes_core.c"
+        "bos_diag_routes_thread.c"
+        "bos_diag_proxy.c"
+        "bos_diag_trigger.c"
+        "bos_diag_phonebook_parse.c"
+        "bos_diag_phonebook_store.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
