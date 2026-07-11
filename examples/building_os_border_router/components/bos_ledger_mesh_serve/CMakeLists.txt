@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "bos_ledger_mesh_serve.c"
+        "bos_mesh_srp_publish.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
