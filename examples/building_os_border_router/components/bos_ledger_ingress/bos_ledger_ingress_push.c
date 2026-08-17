@@ -19,11 +19,36 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_partition.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "bos_ingress";
+
+typedef enum {
+    LEDGER_UPDATE_ACCEPT = 0,
+    LEDGER_UPDATE_IDEMPOTENT,
+    LEDGER_UPDATE_ROLLBACK,
+    LEDGER_UPDATE_DIGEST_CONFLICT,
+} ledger_update_decision_t;
+
+static ledger_update_decision_t ledger_update_decide(const bos_ledger_active_t *active,
+                                                       const bos_ledger_body_view_t *incoming)
+{
+    if (!active || !active->present) {
+        return LEDGER_UPDATE_ACCEPT;
+    }
+    if (incoming->ledger_version < active->version) {
+        return LEDGER_UPDATE_ROLLBACK;
+    }
+    if (incoming->ledger_version > active->version) {
+        return LEDGER_UPDATE_ACCEPT;
+    }
+    return memcmp(incoming->manifest_digest, active->digest, BOS_LEDGER_DIGEST_LEN) == 0
+               ? LEDGER_UPDATE_IDEMPOTENT
+               : LEDGER_UPDATE_DIGEST_CONFLICT;
+}
 
 /* In-flight push guard (docs/08.8-border-router.md s12): a push arriving
  * while a previous push is still being received/validated/persisted gets
@@ -208,6 +233,89 @@ esp_err_t bos_ledger_ingress_http_push(httpd_req_t *req)
         bos_ledger_ingress_set_state(prior_state);
         bos_ledger_set_last_error("validate", err, "ledger envelope digest validation failed", (uint32_t)req->content_len, "");
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ledger envelope digest validation failed");
+        push_guard_release();
+        return ESP_OK;
+    }
+
+    bos_ledger_active_t active = {0};
+    esp_err_t active_err = bos_ledger_ingress_get_active(&active);
+    if (active_err != ESP_OK && active_err != ESP_ERR_NVS_NOT_FOUND) {
+        free(body);
+        bos_ledger_ingress_set_state(prior_state);
+        bos_ledger_set_last_error("active_lookup", active_err,
+                                  "failed to read active ledger metadata",
+                                  (uint32_t)req->content_len, "");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "failed to read active ledger metadata");
+        push_guard_release();
+        return ESP_OK;
+    }
+
+    ledger_update_decision_t decision =
+        ledger_update_decide(active_err == ESP_OK ? &active : NULL, &view);
+    /* A same-version RAM-only copy is safe to accept again: this retries the
+     * failed cache write. A persisted same-version copy exits without flash
+     * erase/write or NVS commit. */
+    if (decision == LEDGER_UPDATE_IDEMPOTENT &&
+        bos_ledger_ingress_persist_state() != BOS_LEDGER_PERSIST_PERSISTED) {
+        decision = LEDGER_UPDATE_ACCEPT;
+    }
+
+    if (decision != LEDGER_UPDATE_ACCEPT) {
+        char incoming_digest[BOS_LEDGER_DIGEST_LEN * 2 + 1];
+        char active_digest[BOS_LEDGER_DIGEST_LEN * 2 + 1];
+        uint32_t incoming_version = view.ledger_version;
+        bos_ledger_digest_hex(view.manifest_digest, incoming_digest);
+        bos_ledger_digest_hex(active.digest, active_digest);
+        free(body);
+
+        if (decision == LEDGER_UPDATE_IDEMPOTENT) {
+            char json[384];
+            int written;
+            bos_ledger_ingress_set_state(BOS_LEDGER_STATE_ACTIVE);
+            written = snprintf(json, sizeof(json),
+                               "{\"ok\":true,\"ledger_version\":%u,\"manifest_digest\":\"%s\","
+                               "\"size_bytes\":%u,\"chunk_size\":%u,\"chunk_count\":%u,"
+                               "\"persist\":\"persisted\",\"idempotent\":true}",
+                               (unsigned)active.version, active_digest,
+                               (unsigned)active.size_bytes, (unsigned)active.chunk_size,
+                               (unsigned)active.chunk_count);
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+            if (written < 0 || written >= (int)sizeof(json)) {
+                httpd_resp_sendstr(req,
+                                   "{\"ok\":true,\"persist\":\"persisted\",\"idempotent\":true}");
+            } else {
+                httpd_resp_sendstr(req, json);
+            }
+        } else {
+            const bool rollback = decision == LEDGER_UPDATE_ROLLBACK;
+            const char *error = rollback ? "ledger_version_rollback"
+                                         : "ledger_version_digest_conflict";
+            const char *message = rollback ? "ledger version lower than active ledger"
+                                           : "same ledger version has different manifest digest";
+            char json[320];
+            int written;
+            bos_ledger_ingress_set_state(prior_state);
+            bos_ledger_set_last_error("version_gate",
+                                      rollback ? ESP_ERR_INVALID_VERSION : ESP_ERR_INVALID_STATE,
+                                      message, (uint32_t)req->content_len, "");
+            written = snprintf(json, sizeof(json),
+                               "{\"ok\":false,\"error\":\"%s\",\"incoming_version\":%u,"
+                               "\"active_version\":%u,\"incoming_digest\":\"%s\","
+                               "\"active_digest\":\"%s\"}",
+                               error, (unsigned)incoming_version, (unsigned)active.version,
+                               incoming_digest, active_digest);
+            httpd_resp_set_status(req, "409 Conflict");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+            if (written < 0 || written >= (int)sizeof(json)) {
+                httpd_resp_sendstr(req,
+                                   "{\"ok\":false,\"error\":\"ledger_version_conflict\"}");
+            } else {
+                httpd_resp_sendstr(req, json);
+            }
+        }
         push_guard_release();
         return ESP_OK;
     }

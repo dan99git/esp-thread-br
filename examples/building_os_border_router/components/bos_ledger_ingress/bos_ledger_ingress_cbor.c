@@ -175,7 +175,8 @@ static bool ledger_locate_body(const uint8_t *bytes, size_t len, bos_ledger_body
     }
 
     uint64_t ledger_version = 0;
-    if (!read_cbor_arg(bytes, len, &pos, 0, &ledger_version) || ledger_version > UINT32_MAX) {
+    if (!read_cbor_arg(bytes, len, &pos, 0, &ledger_version) ||
+        ledger_version == 0U || ledger_version > UINT32_MAX) {
         return false;
     }
 

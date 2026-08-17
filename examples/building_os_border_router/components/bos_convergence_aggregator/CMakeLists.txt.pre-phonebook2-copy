@@ -1,0 +1,12 @@
+idf_component_register(
+    SRCS
+        "bos_convergence_aggregator.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        bos_ledger_ingress
+        esp_timer
+        freertos
+        json
+        openthread
+)

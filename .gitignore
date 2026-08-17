@@ -67,3 +67,7 @@ managed_components
 
 # Docs build output
 docs/_build
+
+# BOS bench build outputs and logs
+examples/building_os_border_router/build_*/
+examples/building_os_border_router/*.log

@@ -1,0 +1,1845 @@
+/**
+ * Building OS Border Router: local diagnostics web surface.
+ */
+
+#include "bos_diagnostics_server.h"
+
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+#include "bos_commissioning.h"
+#include "bos_convergence_aggregator.h"
+#include "bos_joiner.h"
+#include "bos_thread_dataset_anchor.h"
+#include "bos_thread_diag.h"
+#include "bos_br_ota.h"
+#include "bos_ledger_ingress.h"
+#include "bos_server_registration.h"
+#include "cJSON.h"
+#include "esp_br_web.h"
+#include "esp_check.h"
+#include "esp_eth.h"
+#include "esp_event.h"
+#include "esp_http_client.h"
+#include "esp_http_server.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_openthread.h"
+#include "esp_openthread_lock.h"
+#include "esp_rcp_update.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "openthread/coap.h"
+#include "openthread/dns.h"
+#include "openthread/instance.h"
+#include "openthread/ip6.h"
+#include "openthread/link.h"
+#include "openthread/message.h"
+#include "openthread/platform/radio.h"
+#include "openthread/srp_server.h"
+#include "openthread/thread.h"
+#include "protocol_examples_common.h"
+#include "sdkconfig.h"
+
+static const char *TAG = "bos_diag";
+
+static bool s_registered;
+static bool s_backbone_link_up;
+static bool s_backbone_has_ipv4;
+static char s_backbone_ipv4[16] = "";
+static bool s_backbone_has_ipv6;
+static char s_backbone_ipv6[40] = "";
+static char s_backbone_if[24] = "unknown";
+
+static bool is_backbone_netif(esp_netif_t *netif)
+{
+    const char *desc = esp_netif_get_desc(netif);
+    if (!desc) {
+        return false;
+    }
+
+#if CONFIG_EXAMPLE_CONNECT_ETHERNET
+    if (strcmp(desc, EXAMPLE_NETIF_DESC_ETH) == 0) {
+        return true;
+    }
+#endif
+#if CONFIG_EXAMPLE_CONNECT_WIFI
+    if (strcmp(desc, EXAMPLE_NETIF_DESC_STA) == 0) {
+        return true;
+    }
+#endif
+    return false;
+}
+
+static const char *ledger_state_str(bos_ledger_state_t state)
+{
+    switch (state) {
+    case BOS_LEDGER_STATE_NONE:
+        return "none";
+    case BOS_LEDGER_STATE_RECEIVING:
+        return "receiving";
+    case BOS_LEDGER_STATE_VALIDATING:
+        return "validating";
+    case BOS_LEDGER_STATE_COMMITTING:
+        return "committing";
+    case BOS_LEDGER_STATE_ACTIVE:
+        return "active";
+    default:
+        return "unknown";
+    }
+}
+
+static void digest_hex(const uint8_t digest[BOS_LEDGER_DIGEST_LEN], char out[BOS_LEDGER_DIGEST_LEN * 2 + 1])
+{
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < BOS_LEDGER_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    out[BOS_LEDGER_DIGEST_LEN * 2] = '\0';
+}
+
+/* CONFIG_NEWLIB_NANO_FORMAT has no 64-bit printf support; %llu misaligns the
+ * variadic args (LoadProhibited panic, first hit when the active-ledger
+ * handler rendered committed_at). Format u64 manually instead. */
+static void u64_to_dec(uint64_t value, char out[21])
+{
+    char tmp[21];
+    size_t i = 0;
+    do {
+        tmp[i++] = (char)('0' + (value % 10ULL));
+        value /= 10ULL;
+    } while (value != 0 && i < sizeof(tmp) - 1);
+    size_t n = 0;
+    while (i > 0) {
+        out[n++] = tmp[--i];
+    }
+    out[n] = '\0';
+}
+
+static int json_string_or_null(char *out, size_t out_len, const char *value)
+{
+    if (!value || value[0] == '\0') {
+        return snprintf(out, out_len, "null");
+    }
+
+    size_t pos = 0;
+    if (out_len == 0) {
+        return -1;
+    }
+    out[pos++] = '"';
+    for (const unsigned char *p = (const unsigned char *)value; *p != '\0'; p++) {
+        const char *escape = NULL;
+        char unicode_escape[7];
+        switch (*p) {
+        case '"':
+            escape = "\\\"";
+            break;
+        case '\\':
+            escape = "\\\\";
+            break;
+        case '\b':
+            escape = "\\b";
+            break;
+        case '\f':
+            escape = "\\f";
+            break;
+        case '\n':
+            escape = "\\n";
+            break;
+        case '\r':
+            escape = "\\r";
+            break;
+        case '\t':
+            escape = "\\t";
+            break;
+        default:
+            if (*p < 0x20) {
+                snprintf(unicode_escape, sizeof(unicode_escape), "\\u%04x", *p);
+                escape = unicode_escape;
+            }
+            break;
+        }
+
+        if (escape) {
+            size_t len = strlen(escape);
+            if (pos + len >= out_len) {
+                return -1;
+            }
+            memcpy(out + pos, escape, len);
+            pos += len;
+        } else {
+            if (pos + 1 >= out_len) {
+                return -1;
+            }
+            out[pos++] = (char)*p;
+        }
+    }
+    if (pos + 1 >= out_len) {
+        return -1;
+    }
+    out[pos++] = '"';
+    out[pos] = '\0';
+    return (int)pos;
+}
+
+static void send_json(httpd_req_t *req, const char *json)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_sendstr(req, json);
+}
+
+/* Error paths return ESP_OK after the error response is sent: a non-ESP_OK
+ * handler return makes esp_http_server close the socket immediately, which
+ * can reset the connection before the response body is delivered. */
+static esp_err_t send_generated_json(httpd_req_t *req,
+                                     size_t buffer_len,
+                                     int (*renderer)(char *out, size_t out_len),
+                                     const char *error_message)
+{
+    char *json = (char *)malloc(buffer_len);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_OK;
+    }
+
+    int written = renderer(json, buffer_len);
+    if (written < 0) {
+        free(json);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, error_message);
+        return ESP_OK;
+    }
+
+    send_json(req, json);
+    free(json);
+    return ESP_OK;
+}
+
+static esp_err_t ledger_active_get_handler(httpd_req_t *req)
+{
+    bos_ledger_active_t active;
+    esp_err_t err = bos_ledger_ingress_get_active(&active);
+    char last_error_json[256];
+    char json[640];
+
+    if (bos_ledger_ingress_last_error_json(last_error_json, sizeof(last_error_json)) < 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ledger error snapshot too large");
+        return ESP_OK;
+    }
+
+    if (err == ESP_OK && active.present) {
+        char digest[BOS_LEDGER_DIGEST_LEN * 2 + 1];
+        char committed_str[21];
+        digest_hex(active.digest, digest);
+        u64_to_dec(active.committed_at, committed_str);
+        snprintf(json,
+                 sizeof(json),
+                 "{\"present\":true,\"ledger_version\":%u,\"manifest_digest\":\"%s\","
+                 "\"committed_at_ms\":%s,\"state\":\"%s\",\"persist\":\"%s\",\"size_bytes\":%u,"
+                 "\"chunk_size\":%u,\"chunk_count\":%u,\"last_error\":%s}",
+                 (unsigned)active.version,
+                 digest,
+                 committed_str,
+                 ledger_state_str(bos_ledger_ingress_state()),
+                 bos_ledger_ingress_persist_state_str(),
+                 (unsigned)active.size_bytes,
+                 (unsigned)active.chunk_size,
+                 (unsigned)active.chunk_count,
+                 last_error_json);
+    } else {
+        snprintf(json,
+                 sizeof(json),
+                 "{\"present\":false,\"ledger_version\":null,\"manifest_digest\":null,"
+                 "\"committed_at_ms\":null,\"state\":\"%s\",\"persist\":\"%s\",\"last_error\":%s}",
+                 ledger_state_str(bos_ledger_ingress_state()),
+                 bos_ledger_ingress_persist_state_str(),
+                 last_error_json);
+    }
+
+    send_json(req, json);
+    return ESP_OK;
+}
+
+static esp_err_t ledger_push_handler(httpd_req_t *req)
+{
+    return bos_ledger_ingress_http_push(req);
+}
+
+static esp_err_t ledger_torrent_get_handler(httpd_req_t *req)
+{
+    return send_generated_json(req,
+                               12288,
+                               bos_convergence_aggregator_torrent_json,
+                               "failed to render ledger torrent snapshot");
+}
+
+static esp_err_t convergence_get_handler(httpd_req_t *req)
+{
+    return send_generated_json(req,
+                               12288,
+                               bos_convergence_aggregator_snapshot_json,
+                               "failed to render convergence snapshot");
+}
+
+static esp_err_t peers_get_handler(httpd_req_t *req)
+{
+    return send_generated_json(req,
+                               12288,
+                               bos_convergence_aggregator_peers_json,
+                               "failed to render peer snapshot");
+}
+
+static esp_err_t status_get_handler(httpd_req_t *req)
+{
+    typedef struct {
+        char device_id_json[390];
+        char site_server_url_json[970];
+        char firmware_version_json[96];
+        char ledger_error_json[256];
+        char ota_json[1536];
+        char identity_json[1024];
+        char thread_json[224];
+        char json[3840];
+    } status_json_buffers_t;
+
+    status_json_buffers_t *buffers = (status_json_buffers_t *)calloc(1, sizeof(status_json_buffers_t));
+    if (buffers == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_OK;
+    }
+
+    char device_id[64] = "";
+    char site_server_url[160] = "";
+    char firmware_version[40] = "";
+    if (bos_server_registration_get_device_id(device_id, sizeof(device_id)) != ESP_OK) {
+        device_id[0] = '\0';
+    }
+    if (bos_server_registration_get_server_url(site_server_url, sizeof(site_server_url)) != ESP_OK) {
+        site_server_url[0] = '\0';
+    }
+    if (bos_br_ota_app_version(firmware_version, sizeof(firmware_version)) != ESP_OK) {
+        firmware_version[0] = '\0';
+    }
+    if (json_string_or_null(buffers->device_id_json, sizeof(buffers->device_id_json), device_id) < 0 ||
+        json_string_or_null(buffers->site_server_url_json, sizeof(buffers->site_server_url_json), site_server_url) < 0 ||
+        json_string_or_null(buffers->firmware_version_json, sizeof(buffers->firmware_version_json), firmware_version) < 0 ||
+        bos_ledger_ingress_last_error_json(buffers->ledger_error_json, sizeof(buffers->ledger_error_json)) < 0 ||
+        bos_br_ota_status_json(buffers->ota_json, sizeof(buffers->ota_json)) < 0 ||
+        bos_commissioning_identity_json(buffers->identity_json, sizeof(buffers->identity_json)) < 0) {
+        free(buffers);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status metadata too large");
+        return ESP_OK;
+    }
+
+    /* Live Thread runtime: role, network name, PANID, channel, RLOC16.
+     * Never the network key. Renders as null when OpenThread is not up yet
+     * (honest-unavailable, same convention as identity). */
+    bos_thread_runtime_status_t thread_status;
+    if (bos_thread_runtime_status(&thread_status) == ESP_OK) {
+        /* 16-char name, worst case fully escaped (\uXXXX per byte) plus quotes. */
+        char network_name_json[104];
+        int thread_written = -1;
+        if (json_string_or_null(network_name_json, sizeof(network_name_json), thread_status.network_name) >= 0) {
+            thread_written = snprintf(buffers->thread_json,
+                                      sizeof(buffers->thread_json),
+                                      "{\"role\":\"%s\",\"network_name\":%s,\"panid\":\"0x%04x\","
+                                      "\"channel\":%u,\"rloc16\":\"0x%04x\"}",
+                                      thread_status.role,
+                                      network_name_json,
+                                      (unsigned)thread_status.panid,
+                                      (unsigned)thread_status.channel,
+                                      (unsigned)thread_status.rloc16);
+        }
+        if (thread_written < 0 || thread_written >= (int)sizeof(buffers->thread_json)) {
+            free(buffers);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "thread status too large");
+            return ESP_OK;
+        }
+    } else {
+        snprintf(buffers->thread_json, sizeof(buffers->thread_json), "null");
+    }
+    /* Heartbeat buffer counters (docs/08.8 s12 degraded operation): entries
+     * held in the registration RAM ring while the server is unreachable plus
+     * total overflow drops since boot. */
+    uint32_t hb_buffered = 0;
+    uint32_t hb_dropped = 0;
+    bos_server_registration_heartbeat_stats(&hb_buffered, &hb_dropped);
+
+    int written = snprintf(buffers->json,
+                           sizeof(buffers->json),
+                           "{\"device_class\":\"border_router\",\"firmware\":\"building-os-border-router\","
+                           "\"firmware_version\":%s,\"device_id\":%s,\"site_server_url\":%s,"
+                           "\"identity\":%s,"
+                           "\"uptime_ms\":%u,\"heap_free_bytes\":%u,\"registered\":%s,"
+                           "\"heartbeat_buffer\":{\"buffered_count\":%u,\"dropped_count\":%u},"
+                           "\"backbone\":{\"connected\":%s,\"link_up\":%s,\"interface\":\"%s\","
+                           "\"ipv4\":\"%s\",\"ipv6\":\"%s\"},"
+                           "\"thread\":%s,"
+                           "\"rcp\":{\"target\":\"%s\",\"version\":\"not_polled\"},"
+                           "\"ledger\":{\"state\":\"%s\",\"persist\":\"%s\",\"last_error\":%s},\"ota\":%s}",
+                           buffers->firmware_version_json,
+                           buffers->device_id_json,
+                           buffers->site_server_url_json,
+                           buffers->identity_json,
+                           (unsigned)(esp_timer_get_time() / 1000ULL),
+                           (unsigned)esp_get_free_heap_size(),
+                           bos_server_registration_is_registered() ? "true" : "false",
+                           (unsigned)hb_buffered,
+                           (unsigned)hb_dropped,
+                           (s_backbone_link_up && (s_backbone_has_ipv4 || s_backbone_has_ipv6)) ? "true" : "false",
+                           s_backbone_link_up ? "true" : "false",
+                           s_backbone_if,
+                           s_backbone_ipv4,
+                           s_backbone_ipv6,
+                           buffers->thread_json,
+#if CONFIG_ESP_BR_H2_TARGET
+                           "esp32h2",
+#elif CONFIG_ESP_BR_C6_TARGET
+                           "esp32c6",
+#else
+                           "unknown",
+#endif
+                           ledger_state_str(bos_ledger_ingress_state()),
+                           bos_ledger_ingress_persist_state_str(),
+                           buffers->ledger_error_json,
+                           buffers->ota_json);
+    if (written < 0 || written >= (int)sizeof(buffers->json)) {
+        free(buffers);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status snapshot too large");
+        return ESP_OK;
+    }
+
+    send_json(req, buffers->json);
+    free(buffers);
+    return ESP_OK;
+}
+
+/* Honest-unavailable JSON error for /bos/thread-diag with a real HTTP status
+ * (esp_http_server has no 503 in httpd_err_code_t, so the status line is set
+ * directly, same as bos_joiner.c send_error_json). Returns ESP_OK after the
+ * error response is sent (socket-RST rule, see send_generated_json). */
+static esp_err_t thread_diag_send_unavailable(httpd_req_t *req, const char *error)
+{
+    char json[96];
+    int written = snprintf(json, sizeof(json), "{\"ok\":false,\"error\":\"%s\"}", error);
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (written < 0 || written >= (int)sizeof(json)) {
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"internal error\"}");
+    } else {
+        httpd_resp_sendstr(req, json);
+    }
+    return ESP_OK;
+}
+
+/* GET /bos/thread-diag: Thread RX-path self-diagnostics.
+ *
+ * Built for the 2026-06-11 bench failure: a XIAO C6 joiner's legacy beacon
+ * scan and MLE discovery both went unanswered while this BR was leader with
+ * an active commissioner, and the BR had no self-diagnostics to show whether
+ * scanner frames were even reaching the host MAC. Everything served here is
+ * read from APIs that exist in this tree; nothing is fabricated:
+ *   - otLinkGetCounters (openthread/link.h:888, otMacCounters link.h:87):
+ *     MAC rx/tx totals plus the rx filtered/error counters. rx_beacon_request
+ *     only increments when a scanner's Beacon Request makes it through RCP RX
+ *     filtering to the host MAC, so a nearby scanning joiner that never moves
+ *     rx_beacon_request/rx_total is direct evidence of wedged RCP RX
+ *     filtering; tx_beacon shows whether the BR answered.
+ *   - otThreadGetMleCounters (openthread/thread.h:920, otMleCounters
+ *     thread.h:169): role transitions, attach attempts, partition changes.
+ *   - otThreadGetDeviceRole / otThreadDeviceRoleToString
+ *     (openthread/thread.h:747,756).
+ *   - bos_joiner_commissioner_json: otCommissionerGetState
+ *     (openthread/commissioner.h:459) plus the live joiner table via
+ *     otCommissionerGetNextJoinerInfo (commissioner.h:266).
+ *   - bos_joiner_event_trail_json: ring of the last 16 commissioner joiner
+ *     callback events (bos_commissioning/bos_joiner.c).
+ *   - uptime_ms (esp_timer) and heap_free_bytes (esp_get_free_heap_size).
+ * Deliberately NOT served, because no public API exposes them in this tree:
+ * RCP/spinel failure and reset counters. OpenThread keeps mRcpFailureCount
+ * private to the C++ RadioSpinel class (openthread/src/lib/spinel/
+ * radio_spinel.cpp:89) and esp-openthread exposes only callback registration
+ * (esp_openthread_spinel.h:20,40); that single handler slot is already owned
+ * by the upstream RCP recovery path (components/esp_rcp_update/src/
+ * esp_ot_rcp_update.c:66..71), so re-registering here would replace upstream
+ * recovery. Omitted rather than faked. A discovery-request-level counter
+ * likewise does not exist in the OT public API; the MAC rx counters plus the
+ * joiner event trail are the deliverable.
+ * Auth: none; read-only diagnostics, same boundary as /bos/status. */
+static esp_err_t thread_diag_get_handler(httpd_req_t *req)
+{
+    typedef struct {
+        char commissioner_json[512];
+        char events_json[1664];
+        char json[4096];
+    } thread_diag_buffers_t;
+
+    thread_diag_buffers_t *buffers = (thread_diag_buffers_t *)calloc(1, sizeof(thread_diag_buffers_t));
+    if (buffers == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_OK;
+    }
+
+    char uptime_str[21];
+    u64_to_dec((uint64_t)esp_timer_get_time() / 1000ULL, uptime_str);
+
+    if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(2000))) {
+        free(buffers);
+        return thread_diag_send_unavailable(req, "openthread lock timeout");
+    }
+
+    otInstance *instance = esp_openthread_get_instance();
+    if (!otInstanceIsInitialized(instance)) {
+        esp_openthread_lock_release();
+        free(buffers);
+        return thread_diag_send_unavailable(req, "openthread not running");
+    }
+
+    const char *role = otThreadDeviceRoleToString(otThreadGetDeviceRole(instance));
+    const otMacCounters *mac = otLinkGetCounters(instance);
+    const otMleCounters *mle = otThreadGetMleCounters(instance);
+    otMacCounters mac_copy = *mac;
+    otMleCounters mle_copy = *mle;
+
+    if (bos_joiner_commissioner_json(buffers->commissioner_json, sizeof(buffers->commissioner_json)) < 0 ||
+        bos_joiner_event_trail_json(buffers->events_json, sizeof(buffers->events_json)) < 0) {
+        esp_openthread_lock_release();
+        free(buffers);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "commissioner snapshot too large");
+        return ESP_OK;
+    }
+
+    esp_openthread_lock_release();
+
+    /* otMleCounters time-in-role fields are uint64 milliseconds; rendered via
+     * u64_to_dec (never %llu, nano printf rule above). */
+    char disabled_time[21], detached_time[21], child_time[21];
+    char router_time[21], leader_time[21], tracked_time[21];
+    u64_to_dec(mle_copy.mDisabledTime, disabled_time);
+    u64_to_dec(mle_copy.mDetachedTime, detached_time);
+    u64_to_dec(mle_copy.mChildTime, child_time);
+    u64_to_dec(mle_copy.mRouterTime, router_time);
+    u64_to_dec(mle_copy.mLeaderTime, leader_time);
+    u64_to_dec(mle_copy.mTrackedTime, tracked_time);
+
+    int written = snprintf(buffers->json,
+                           sizeof(buffers->json),
+                           "{\"uptime_ms\":%s,\"heap_free_bytes\":%u,\"role\":\"%s\","
+                           "\"mac_counters\":{"
+                           "\"tx_total\":%u,\"tx_unicast\":%u,\"tx_broadcast\":%u,"
+                           "\"tx_acked\":%u,\"tx_retry\":%u,"
+                           "\"tx_beacon\":%u,\"tx_beacon_request\":%u,"
+                           "\"tx_err_cca\":%u,\"tx_err_abort\":%u,\"tx_err_busy_channel\":%u,"
+                           "\"rx_total\":%u,\"rx_unicast\":%u,\"rx_broadcast\":%u,"
+                           "\"rx_data\":%u,\"rx_data_poll\":%u,"
+                           "\"rx_beacon\":%u,\"rx_beacon_request\":%u,\"rx_other\":%u,"
+                           "\"rx_address_filtered\":%u,\"rx_dest_addr_filtered\":%u,"
+                           "\"rx_duplicated\":%u,\"rx_err_no_frame\":%u,"
+                           "\"rx_err_unknown_neighbor\":%u,\"rx_err_invalid_src_addr\":%u,"
+                           "\"rx_err_sec\":%u,\"rx_err_fcs\":%u,\"rx_err_other\":%u},"
+                           "\"mle_counters\":{"
+                           "\"disabled_role\":%u,\"detached_role\":%u,\"child_role\":%u,"
+                           "\"router_role\":%u,\"leader_role\":%u,"
+                           "\"attach_attempts\":%u,\"partition_id_changes\":%u,"
+                           "\"better_partition_attach_attempts\":%u,\"parent_changes\":%u,"
+                           "\"disabled_time_ms\":%s,\"detached_time_ms\":%s,\"child_time_ms\":%s,"
+                           "\"router_time_ms\":%s,\"leader_time_ms\":%s,\"tracked_time_ms\":%s},"
+                           "\"commissioner\":%s,\"joiner_events\":%s}",
+                           uptime_str,
+                           (unsigned)esp_get_free_heap_size(),
+                           role,
+                           (unsigned)mac_copy.mTxTotal,
+                           (unsigned)mac_copy.mTxUnicast,
+                           (unsigned)mac_copy.mTxBroadcast,
+                           (unsigned)mac_copy.mTxAcked,
+                           (unsigned)mac_copy.mTxRetry,
+                           (unsigned)mac_copy.mTxBeacon,
+                           (unsigned)mac_copy.mTxBeaconRequest,
+                           (unsigned)mac_copy.mTxErrCca,
+                           (unsigned)mac_copy.mTxErrAbort,
+                           (unsigned)mac_copy.mTxErrBusyChannel,
+                           (unsigned)mac_copy.mRxTotal,
+                           (unsigned)mac_copy.mRxUnicast,
+                           (unsigned)mac_copy.mRxBroadcast,
+                           (unsigned)mac_copy.mRxData,
+                           (unsigned)mac_copy.mRxDataPoll,
+                           (unsigned)mac_copy.mRxBeacon,
+                           (unsigned)mac_copy.mRxBeaconRequest,
+                           (unsigned)mac_copy.mRxOther,
+                           (unsigned)mac_copy.mRxAddressFiltered,
+                           (unsigned)mac_copy.mRxDestAddrFiltered,
+                           (unsigned)mac_copy.mRxDuplicated,
+                           (unsigned)mac_copy.mRxErrNoFrame,
+                           (unsigned)mac_copy.mRxErrUnknownNeighbor,
+                           (unsigned)mac_copy.mRxErrInvalidSrcAddr,
+                           (unsigned)mac_copy.mRxErrSec,
+                           (unsigned)mac_copy.mRxErrFcs,
+                           (unsigned)mac_copy.mRxErrOther,
+                           (unsigned)mle_copy.mDisabledRole,
+                           (unsigned)mle_copy.mDetachedRole,
+                           (unsigned)mle_copy.mChildRole,
+                           (unsigned)mle_copy.mRouterRole,
+                           (unsigned)mle_copy.mLeaderRole,
+                           (unsigned)mle_copy.mAttachAttempts,
+                           (unsigned)mle_copy.mPartitionIdChanges,
+                           (unsigned)mle_copy.mBetterPartitionAttachAttempts,
+                           (unsigned)mle_copy.mParentChanges,
+                           disabled_time,
+                           detached_time,
+                           child_time,
+                           router_time,
+                           leader_time,
+                           tracked_time,
+                           buffers->commissioner_json,
+                           buffers->events_json);
+    if (written < 0 || written >= (int)sizeof(buffers->json)) {
+        free(buffers);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "thread diagnostics snapshot too large");
+        return ESP_OK;
+    }
+
+    send_json(req, buffers->json);
+    free(buffers);
+    return ESP_OK;
+}
+
+/* Honest JSON error with an explicit status line (esp_http_server's
+ * httpd_err_code_t has no 401/502/503). Returns ESP_OK after the error
+ * response is sent (socket-RST rule, see send_generated_json). */
+static esp_err_t send_status_json(httpd_req_t *req, const char *status_line, const char *error)
+{
+    char json[160];
+    int written = snprintf(json, sizeof(json), "{\"ok\":false,\"error\":\"%s\"}", error);
+    httpd_resp_set_status(req, status_line);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (written < 0 || written >= (int)sizeof(json)) {
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"internal error\"}");
+    } else {
+        httpd_resp_sendstr(req, json);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t send_unauthorized(httpd_req_t *req)
+{
+    return send_status_json(req, "401 Unauthorized", "device token or api key required");
+}
+
+/* Serialize a cJSON tree and send it. Returns ESP_OK always (RST rule). */
+static esp_err_t send_cjson(httpd_req_t *req, cJSON *root)
+{
+    char *text = cJSON_PrintUnformatted(root);
+    if (!text) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_OK;
+    }
+    send_json(req, text);
+    cJSON_free(text);
+    return ESP_OK;
+}
+
+/* Read the request body into buf (NUL-terminated). Returns body length,
+ * or -1 on socket error / body larger than buf. */
+static int read_request_body(httpd_req_t *req, char *buf, size_t buf_len)
+{
+    if (req->content_len >= buf_len) {
+        return -1;
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int ret = httpd_req_recv(req, buf + received, req->content_len - received);
+        if (ret <= 0) {
+            return -1;
+        }
+        received += (size_t)ret;
+    }
+    buf[received] = '\0';
+    return (int)received;
+}
+
+/* GET /bos/radio: the BR 802.15.4 radio window. The H2 RCP TX power is the
+ * only C6-equivalent RF lever on this board (H2-MINI fixed PCB antenna,
+ * single RF path; docs/scratch/br-range-and-fork-review-2026-06-12.md), so
+ * the read returns tx_power_dbm (otPlatRadioGetTransmitPower readback, the
+ * radio's achieved value, not a cached request) plus the live channel.
+ * Open-on-LAN read, same boundary as /bos/status. Consumer contract:
+ * tools/codex-plugin/plugins/building-os/scripts/br-radio.mjs. */
+static esp_err_t radio_get_handler(httpd_req_t *req)
+{
+    if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(2000))) {
+        return thread_diag_send_unavailable(req, "openthread lock timeout");
+    }
+    otInstance *instance = esp_openthread_get_instance();
+    if (!otInstanceIsInitialized(instance)) {
+        esp_openthread_lock_release();
+        return thread_diag_send_unavailable(req, "openthread not running");
+    }
+    int8_t tx_power = 0;
+    otError tx_err = otPlatRadioGetTransmitPower(instance, &tx_power);
+    uint8_t channel = otLinkGetChannel(instance);
+    esp_openthread_lock_release();
+
+    if (tx_err != OT_ERROR_NONE) {
+        return thread_diag_send_unavailable(req, "tx power not readable");
+    }
+
+    char json[96];
+    int written = snprintf(json,
+                           sizeof(json),
+                           "{\"tx_power_dbm\":%d,\"channel\":%u}",
+                           (int)tx_power,
+                           (unsigned)channel);
+    if (written < 0 || written >= (int)sizeof(json)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "radio snapshot too large");
+        return ESP_OK;
+    }
+    send_json(req, json);
+    return ESP_OK;
+}
+
+/* POST /bos/radio: set the live H2 802.15.4 TX power. Body
+ * {"tx_power_dbm":N}, N integer -24..20 (H2 RCP supported range; the radio
+ * clamps and the response returns the achieved readback). Token-authed, same
+ * trust anchor as /bos/commission (bos_commissioning_request_authorized).
+ * Does NOT persist: the boot default is the app_main.c 20 dBm assert. */
+static esp_err_t radio_post_handler(httpd_req_t *req)
+{
+    if (!bos_commissioning_request_authorized(req)) {
+        return send_unauthorized(req);
+    }
+
+    char body[160];
+    if (read_request_body(req, body, sizeof(body)) < 0) {
+        return send_status_json(req, "400 Bad Request", "empty or oversized body");
+    }
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        return send_status_json(req, "400 Bad Request", "invalid JSON");
+    }
+    const cJSON *tx_j = cJSON_GetObjectItemCaseSensitive(root, "tx_power_dbm");
+    if (!cJSON_IsNumber(tx_j)) {
+        cJSON_Delete(root);
+        return send_status_json(req, "400 Bad Request", "tx_power_dbm must be a number");
+    }
+    int requested = tx_j->valueint;
+    cJSON_Delete(root);
+    if (requested < -24 || requested > 20) {
+        return send_status_json(req, "400 Bad Request", "tx_power_dbm out of range (-24..20 dBm)");
+    }
+
+    if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(2000))) {
+        return thread_diag_send_unavailable(req, "openthread lock timeout");
+    }
+    otInstance *instance = esp_openthread_get_instance();
+    if (!otInstanceIsInitialized(instance)) {
+        esp_openthread_lock_release();
+        return thread_diag_send_unavailable(req, "openthread not running");
+    }
+    otError set_err = otPlatRadioSetTransmitPower(instance, (int8_t)requested);
+    int8_t achieved = 0;
+    otError get_err = otPlatRadioGetTransmitPower(instance, &achieved);
+    esp_openthread_lock_release();
+
+    if (set_err != OT_ERROR_NONE) {
+        return send_status_json(req, "500 Internal Server Error", "failed to set tx power");
+    }
+    ESP_LOGI(TAG, "802.15.4 TX power set over /bos/radio: requested %d, achieved %d",
+             requested, (get_err == OT_ERROR_NONE) ? (int)achieved : requested);
+
+    char json[96];
+    int written = snprintf(json,
+                           sizeof(json),
+                           "{\"ok\":true,\"tx_power_dbm\":%d}",
+                           (get_err == OT_ERROR_NONE) ? (int)achieved : requested);
+    if (written < 0 || written >= (int)sizeof(json)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "radio snapshot too large");
+        return ESP_OK;
+    }
+    send_json(req, json);
+    return ESP_OK;
+}
+
+/* GET /bos/thread-neighbors: local neighbor table with per-link RSSI/LQI -
+ * the C6<->BR link-quality window seen from the BR (the missing window from
+ * the 2026-06-12 morning bench, docs/scratch/radio-levers-and-windows W2).
+ * Rendering is the shared bos_thread_diag component
+ * (firmware/shared-components/bos_thread_diag, docs/08.2 section 7); the
+ * walk runs under the held OT lock, BR cap 32. Output shape matches the C6
+ * /api/thread-neighbors: role, rloc16, neighbor_count, neighbors[].
+ * Open-on-LAN read. Consumer contract: br-thread-neighbors.mjs. */
+static esp_err_t thread_neighbors_get_handler(httpd_req_t *req)
+{
+    if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(2000))) {
+        return thread_diag_send_unavailable(req, "openthread lock timeout");
+    }
+    otInstance *instance = esp_openthread_get_instance();
+    if (!otInstanceIsInitialized(instance)) {
+        esp_openthread_lock_release();
+        return thread_diag_send_unavailable(req, "openthread not running");
+    }
+    const char *role = otThreadDeviceRoleToString(otThreadGetDeviceRole(instance));
+    uint16_t self_rloc16 = otThreadGetRloc16(instance);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = root ? cJSON_CreateArray() : NULL;
+    if (!root || !arr) {
+        esp_openthread_lock_release();
+        cJSON_Delete(root);
+        cJSON_Delete(arr);
+        return thread_diag_send_unavailable(req, "out of memory");
+    }
+    size_t count = bos_thread_diag_add_neighbors(instance, arr, 32);
+    esp_openthread_lock_release();
+
+    cJSON_AddStringToObject(root, "role", role);
+    char self_hex[8];
+    snprintf(self_hex, sizeof(self_hex), "0x%04x", (unsigned)self_rloc16);
+    cJSON_AddStringToObject(root, "rloc16", self_hex);
+    cJSON_AddNumberToObject(root, "neighbor_count", (double)count);
+    cJSON_AddItemToObject(root, "neighbors", arr);
+
+    esp_err_t ret = send_cjson(req, root);
+    cJSON_Delete(root);
+    return ret;
+}
+
+/* POST /bos/thread-reset: RCP hard reset, the wedged-RCP recovery lever
+ * (skill br-thread-commissioning-diagnostics; first built and executed live
+ * 2026-06-11, lost in the 2026-06-12 revert). Uses the established
+ * esp_rcp_update mechanism (esp_rcp_reset(), components/esp_rcp_update/src/
+ * esp_rcp_update.c:322 - drives CONFIG_PIN_TO_RCP_RESET, GPIO 7 on this
+ * board) rather than raw GPIO. Sequence: Thread + IPv6 down under the OT
+ * lock, RCP reset pulse, settle, IPv6 + Thread back up; the persisted
+ * operational dataset (bos_thread_dataset_anchor) re-adopts on re-enable, so
+ * the network re-forms (~20 s to leader on the bench record). Token-authed
+ * write, same trust anchor as /bos/commission. */
+static esp_err_t thread_reset_post_handler(httpd_req_t *req)
+{
+    if (!bos_commissioning_request_authorized(req)) {
+        return send_unauthorized(req);
+    }
+
+    if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(5000))) {
+        return thread_diag_send_unavailable(req, "openthread lock timeout");
+    }
+    otInstance *instance = esp_openthread_get_instance();
+    if (!otInstanceIsInitialized(instance)) {
+        esp_openthread_lock_release();
+        return thread_diag_send_unavailable(req, "openthread not running");
+    }
+    otThreadSetEnabled(instance, false);
+    otIp6SetEnabled(instance, false);
+    esp_openthread_lock_release();
+
+    ESP_LOGW(TAG, "RCP hard reset requested over /bos/thread-reset");
+    esp_rcp_reset();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(5000))) {
+        return thread_diag_send_unavailable(req, "openthread lock timeout after rcp reset");
+    }
+    otError ip6_err = otIp6SetEnabled(instance, true);
+    otError thread_err = otThreadSetEnabled(instance, true);
+    const char *role = otThreadDeviceRoleToString(otThreadGetDeviceRole(instance));
+    esp_openthread_lock_release();
+
+    char json[192];
+    int written = snprintf(json,
+                           sizeof(json),
+                           "{\"ok\":%s,\"reset\":\"rcp_hard_reset\",\"ip6_reenabled\":%s,"
+                           "\"thread_reenabled\":%s,\"role\":\"%s\"}",
+                           (ip6_err == OT_ERROR_NONE && thread_err == OT_ERROR_NONE) ? "true" : "false",
+                           (ip6_err == OT_ERROR_NONE) ? "true" : "false",
+                           (thread_err == OT_ERROR_NONE) ? "true" : "false",
+                           role);
+    if (written < 0 || written >= (int)sizeof(json)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "reset snapshot too large");
+        return ESP_OK;
+    }
+    send_json(req, json);
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------------------
+ * /bos/device/<eui64>/<path...>: the BR device-UI proxy (control-plane
+ * slice 0, docs/scratch/control-plane doc; THE route the over-Thread goal
+ * needs). The BR is the only node on both the LAN and the Thread mesh, so it
+ * bridges a LAN client to a mesh device's port-80 surface. Keyed by the
+ * durable EUI-64: the device's mesh IPv6 is ephemeral and resolved BR-side
+ * from its SRP registration (otSrpServerGetNextHost host walk -> TXT
+ * hw/hid/eui64 entry match -> host address; same table and TXT contract as
+ * bos_convergence_aggregator). Forwarded with esp_http_client preserving
+ * method, body, and Content-Type; the device response is streamed back
+ * chunk-by-chunk with its status and Content-Type.
+ * Auth: GET is open-on-LAN (same model as /bos/status); PUT/POST reach the
+ * device CONTROL surface and require the device token / api key
+ * (bos_commissioning_request_authorized). Consumer contract:
+ * br-device-proxy.mjs + skill building-os:br-device-proxy.
+ * ------------------------------------------------------------------------ */
+
+#define BOS_PROXY_URI_PREFIX "/bos/device/"
+#define BOS_PROXY_BODY_MAX 8192
+#define BOS_PROXY_CHUNK_LEN 1024
+#define BOS_PROXY_TIMEOUT_MS 8000
+
+typedef struct {
+    char content_type[96];
+} proxy_response_meta_t;
+
+typedef struct {
+    otIp6Address address;
+    uint16_t http_port;
+} proxy_target_t;
+
+static esp_err_t proxy_http_event_cb(esp_http_client_event_t *evt)
+{
+    if (evt->event_id == HTTP_EVENT_ON_HEADER && evt->user_data &&
+        evt->header_key && evt->header_value &&
+        strcasecmp(evt->header_key, "Content-Type") == 0) {
+        proxy_response_meta_t *meta = (proxy_response_meta_t *)evt->user_data;
+        snprintf(meta->content_type, sizeof(meta->content_type), "%s", evt->header_value);
+    }
+    return ESP_OK;
+}
+
+/* Accepts the full 16-hex EUI-64 (br-device-proxy.mjs sends this) and the
+ * 12-hex EUI-48 short form (the fffe-elided form used in bench notes, e.g.
+ * 9888e07f83b8 for 9888e0fffe7f83b8); the short form expands by re-inserting
+ * fffe. Output is the lowercase 16-hex canonical form. */
+static bool proxy_normalise_eui64(const char *raw, size_t raw_len, char out[17])
+{
+    char lowered[17];
+    if (raw_len != 16 && raw_len != 12) {
+        return false;
+    }
+    for (size_t i = 0; i < raw_len; i++) {
+        if (!isxdigit((unsigned char)raw[i])) {
+            return false;
+        }
+        lowered[i] = (char)tolower((unsigned char)raw[i]);
+    }
+    lowered[raw_len] = '\0';
+    if (raw_len == 16) {
+        memcpy(out, lowered, 17);
+    } else {
+        memcpy(out, lowered, 6);
+        memcpy(out + 6, "fffe", 4);
+        memcpy(out + 10, lowered + 6, 6);
+        out[16] = '\0';
+    }
+    return true;
+}
+
+/* Address-selection scope ranking for the SRP host walk. A device registers
+ * MULTIPLE addresses with the SRP server (routable OMR/GUA, the stable
+ * mesh-local ML-EID, the RLOC, and sometimes a link-local). The esp_http_client
+ * forward must target the ROUTABLE (OMR) address; forwarding to a mesh-local,
+ * RLOC, or link-local address is what caused the intermittent post-re-form 502
+ * (the proxy used to take the first non-zero entry regardless of scope).
+ *
+ * The classification mirrors the C6's own /api/identity scope labels
+ * (firmware web_server.c ip6_scope_label) but works on the bare otIp6Address
+ * the SRP server hands back (no otNetifAddress mRloc/mMeshLocal flags here), so
+ * it classifies by prefix bytes and the BR's mesh-local prefix instead. */
+typedef enum {
+    PROXY_SCOPE_UNUSABLE   = 0, /* unspecified / loopback / multicast */
+    PROXY_SCOPE_LINK_LOCAL = 1, /* fe80::/10 */
+    PROXY_SCOPE_RLOC       = 2, /* mesh-local prefix + RLOC IID (00:00:00ff:fe00:xxxx) */
+    PROXY_SCOPE_MESH_LOCAL = 3, /* mesh-local prefix, ML-EID */
+    PROXY_SCOPE_ROUTABLE   = 4, /* OMR/GUA: the address the forward must use */
+} proxy_addr_scope_t;
+
+/* True when addr's network prefix (top 64 bits) equals the BR's mesh-local
+ * prefix. otMeshLocalPrefix is the 8-byte /64 mesh-local prefix. */
+static bool proxy_addr_in_mesh_local(const otIp6Address *addr, const otMeshLocalPrefix *mlp)
+{
+    return mlp != NULL && memcmp(addr->mFields.m8, mlp->m8, OT_MESH_LOCAL_PREFIX_SIZE) == 0;
+}
+
+/* The Thread RLOC IID is fixed: 0000:00ff:fe00:RLOC16 (bytes 8..15). */
+static bool proxy_addr_is_rloc_iid(const otIp6Address *addr)
+{
+    const uint8_t *iid = &addr->mFields.m8[8];
+    return iid[0] == 0x00U && iid[1] == 0x00U && iid[2] == 0x00U && iid[3] == 0xffU &&
+           iid[4] == 0xfeU && iid[5] == 0x00U;
+}
+
+static proxy_addr_scope_t proxy_classify_address(const otIp6Address *addr,
+                                                 const otMeshLocalPrefix *mlp)
+{
+    static const uint8_t zero[16] = {0};
+    if (memcmp(addr->mFields.m8, zero, sizeof(zero)) == 0) {
+        return PROXY_SCOPE_UNUSABLE; /* unspecified */
+    }
+    if (addr->mFields.m8[0] == 0xffU) {
+        return PROXY_SCOPE_UNUSABLE; /* multicast (must never be an SRP host addr) */
+    }
+    /* fe80::/10 link-local: first byte 0xfe, top two bits of second byte = 10. */
+    if (addr->mFields.m8[0] == 0xfeU && (addr->mFields.m8[1] & 0xc0U) == 0x80U) {
+        return PROXY_SCOPE_LINK_LOCAL;
+    }
+    if (proxy_addr_in_mesh_local(addr, mlp)) {
+        return proxy_addr_is_rloc_iid(addr) ? PROXY_SCOPE_RLOC : PROXY_SCOPE_MESH_LOCAL;
+    }
+    /* Anything else with a global ULA/GUA prefix (the OMR address). */
+    return PROXY_SCOPE_ROUTABLE;
+}
+
+/* SRP host walk under the held OT lock. The _mesh._udp TXT contract
+ * publishes the EUI-64 under hw (aliases hid/eui64/hardware_id; see
+ * bos_convergence_aggregator parse_txt_into_peer) and the device web port
+ * under http (default 80). Returns true with the BEST-SCOPED host address
+ * (routable OMR preferred over mesh-local/rloc/link-local) when a TXT entry
+ * matches the canonical EUI-64. */
+static bool proxy_resolve_eui64(otInstance *instance, const char *eui64, proxy_target_t *out)
+{
+    if (otSrpServerGetState(instance) != OT_SRP_SERVER_STATE_RUNNING) {
+        return false;
+    }
+
+    const otMeshLocalPrefix *mlp = otThreadGetMeshLocalPrefix(instance);
+
+    const otSrpServerHost *host = NULL;
+    while ((host = otSrpServerGetNextHost(instance, host)) != NULL) {
+        if (otSrpServerHostIsDeleted(host)) {
+            continue;
+        }
+
+        bool matched = false;
+        uint16_t http_port = 80;
+        const otSrpServerService *service = NULL;
+        while ((service = otSrpServerHostGetNextService(host, service)) != NULL) {
+            if (otSrpServerServiceIsDeleted(service)) {
+                continue;
+            }
+            uint16_t txt_len = 0;
+            const uint8_t *txt = otSrpServerServiceGetTxtData(service, &txt_len);
+            if (!txt || txt_len == 0U) {
+                continue;
+            }
+            otDnsTxtEntryIterator iterator;
+            otDnsInitTxtEntryIterator(&iterator, txt, txt_len);
+            otDnsTxtEntry entry;
+            while (otDnsGetNextTxtEntry(&iterator, &entry) == OT_ERROR_NONE) {
+                if (!entry.mKey || !entry.mValue || entry.mValueLength == 0U) {
+                    continue;
+                }
+                char value[40];
+                size_t copy_len = entry.mValueLength < sizeof(value) - 1 ? entry.mValueLength : sizeof(value) - 1;
+                memcpy(value, entry.mValue, copy_len);
+                value[copy_len] = '\0';
+                if (strcmp(entry.mKey, "hw") == 0 ||
+                    strcmp(entry.mKey, "hid") == 0 ||
+                    strcmp(entry.mKey, "eui64") == 0 ||
+                    strcmp(entry.mKey, "hardware_id") == 0) {
+                    if (strcasecmp(value, eui64) == 0) {
+                        matched = true;
+                    }
+                } else if (strcmp(entry.mKey, "http") == 0) {
+                    unsigned long port = strtoul(value, NULL, 10);
+                    if (port > 0UL && port <= 65535UL) {
+                        http_port = (uint16_t)port;
+                    }
+                }
+            }
+        }
+
+        if (!matched) {
+            continue;
+        }
+
+        /* Pick the best-scoped registered address rather than the first
+         * non-zero one. A device registers several addresses; only the
+         * routable OMR address is reachable for the esp_http_client forward.
+         * Prefer routable > mesh-local > rloc > link-local; skip unusable
+         * (unspecified/multicast). This removes the intermittent 502 that
+         * occurred when the first SRP entry happened to be a non-routable
+         * (mesh-local/rloc/link-local) address. */
+        uint8_t address_count = 0;
+        const otIp6Address *addresses = otSrpServerHostGetAddresses(host, &address_count);
+        const otIp6Address *best = NULL;
+        proxy_addr_scope_t best_scope = PROXY_SCOPE_UNUSABLE;
+        for (uint8_t i = 0; addresses && i < address_count; i++) {
+            proxy_addr_scope_t scope = proxy_classify_address(&addresses[i], mlp);
+            if (scope > best_scope) {
+                best_scope = scope;
+                best = &addresses[i];
+            }
+        }
+        if (best != NULL && best_scope != PROXY_SCOPE_UNUSABLE) {
+            out->address = *best;
+            out->http_port = http_port;
+            if (best_scope != PROXY_SCOPE_ROUTABLE) {
+                /* Reachable-but-suboptimal: no routable OMR address was
+                 * registered (e.g. mid-reform before the C6 re-registers).
+                 * Forward anyway on the best available, but log it so a
+                 * persistent non-routable selection is visible at the bench. */
+                ESP_LOGW(TAG,
+                         "proxy resolve %s: no routable address registered, "
+                         "forwarding on scope=%d", eui64, (int)best_scope);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *http_status_reason(int status)
+{
+    switch (status) {
+    case 200: return "OK";
+    case 201: return "Created";
+    case 204: return "No Content";
+    case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 403: return "Forbidden";
+    case 404: return "Not Found";
+    case 409: return "Conflict";
+    case 413: return "Payload Too Large";
+    case 500: return "Internal Server Error";
+    case 503: return "Service Unavailable";
+    default:  return "Status";
+    }
+}
+
+static esp_err_t device_proxy_handler(httpd_req_t *req)
+{
+    /* GET is open-on-LAN; PUT/POST reach the device control surface and are
+     * privileged (same trust anchor as /bos/commission). */
+    if (req->method != HTTP_GET && !bos_commissioning_request_authorized(req)) {
+        return send_unauthorized(req);
+    }
+
+    /* Parse /bos/device/<eui64>/<path...> out of the request URI (query
+     * string included in req->uri and forwarded as-is). */
+    const size_t prefix_len = strlen(BOS_PROXY_URI_PREFIX);
+    if (strncmp(req->uri, BOS_PROXY_URI_PREFIX, prefix_len) != 0) {
+        return send_status_json(req, "400 Bad Request", "malformed proxy uri");
+    }
+    const char *eui_start = req->uri + prefix_len;
+    const char *eui_end = strchr(eui_start, '/');
+    size_t eui_len = eui_end ? (size_t)(eui_end - eui_start) : strlen(eui_start);
+    char eui64[17];
+    if (!proxy_normalise_eui64(eui_start, eui_len, eui64)) {
+        return send_status_json(req, "400 Bad Request", "eui64 must be 16 (or fffe-elided 12) hex chars");
+    }
+    const char *device_path = (eui_end && eui_end[0] != '\0') ? eui_end : "/";
+
+    /* Request body (PUT/POST), preserved verbatim. */
+    char *body = NULL;
+    int body_len = 0;
+    if (req->method != HTTP_GET && req->content_len > 0) {
+        if (req->content_len > BOS_PROXY_BODY_MAX) {
+            return send_status_json(req, "413 Payload Too Large", "proxy body over 8192 bytes");
+        }
+        body = (char *)malloc(req->content_len + 1);
+        if (!body) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+            return ESP_OK;
+        }
+        body_len = read_request_body(req, body, req->content_len + 1);
+        if (body_len < 0) {
+            free(body);
+            return send_status_json(req, "400 Bad Request", "failed to read request body");
+        }
+    }
+
+    /* Resolve the EUI-64 to a mesh address via the SRP server table. */
+    proxy_target_t target = {.http_port = 80};
+    if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(2000))) {
+        free(body);
+        return thread_diag_send_unavailable(req, "openthread lock timeout");
+    }
+    otInstance *instance = esp_openthread_get_instance();
+    if (!otInstanceIsInitialized(instance)) {
+        esp_openthread_lock_release();
+        free(body);
+        return thread_diag_send_unavailable(req, "openthread not running");
+    }
+    bool resolved = proxy_resolve_eui64(instance, eui64, &target);
+    esp_openthread_lock_release();
+    if (!resolved) {
+        free(body);
+        return send_status_json(req, "404 Not Found", "device not found in SRP registrations");
+    }
+
+    char address_str[OT_IP6_ADDRESS_STRING_SIZE];
+    otIp6AddressToString(&target.address, address_str, sizeof(address_str));
+
+    char url[256];
+    int url_len = snprintf(url, sizeof(url), "http://[%s]:%u%s",
+                           address_str, (unsigned)target.http_port, device_path);
+    if (url_len < 0 || url_len >= (int)sizeof(url)) {
+        free(body);
+        return send_status_json(req, "400 Bad Request", "proxied url too long");
+    }
+
+    /* Forward over the mesh. Manual open/fetch_headers mode so the response
+     * streams back without buffering the whole body. */
+    proxy_response_meta_t meta = {.content_type = ""};
+    esp_http_client_config_t config = {
+        .url = url,
+        .timeout_ms = BOS_PROXY_TIMEOUT_MS,
+        .event_handler = proxy_http_event_cb,
+        .user_data = &meta,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        free(body);
+        return send_status_json(req, "502 Bad Gateway", "proxy client init failed");
+    }
+    esp_http_client_set_method(client,
+                               (req->method == HTTP_PUT)  ? HTTP_METHOD_PUT
+                               : (req->method == HTTP_POST) ? HTTP_METHOD_POST
+                                                            : HTTP_METHOD_GET);
+    if (body_len > 0) {
+        char content_type[96];
+        if (httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type)) != ESP_OK) {
+            snprintf(content_type, sizeof(content_type), "application/json");
+        }
+        esp_http_client_set_header(client, "Content-Type", content_type);
+    }
+
+    esp_err_t err = esp_http_client_open(client, body_len);
+    if (err != ESP_OK) {
+        esp_http_client_cleanup(client);
+        free(body);
+        ESP_LOGW(TAG, "proxy open to %s failed: %s", url, esp_err_to_name(err));
+        return send_status_json(req, "502 Bad Gateway", "device unreachable over mesh");
+    }
+    if (body_len > 0 && esp_http_client_write(client, body, body_len) != body_len) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        free(body);
+        return send_status_json(req, "502 Bad Gateway", "failed to forward request body");
+    }
+    free(body);
+    body = NULL;
+
+    if (esp_http_client_fetch_headers(client) < 0) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return send_status_json(req, "502 Bad Gateway", "no response from device");
+    }
+
+    int status = esp_http_client_get_status_code(client);
+    char status_line[48];
+    snprintf(status_line, sizeof(status_line), "%d %s", status, http_status_reason(status));
+    httpd_resp_set_status(req, status_line);
+    httpd_resp_set_type(req, meta.content_type[0] != '\0' ? meta.content_type : "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    char chunk[BOS_PROXY_CHUNK_LEN];
+    for (;;) {
+        int read_len = esp_http_client_read(client, chunk, sizeof(chunk));
+        if (read_len < 0) {
+            /* Mid-stream failure: abort the chunked transfer honestly rather
+             * than presenting a truncated body as complete. */
+            httpd_resp_send_chunk(req, NULL, 0);
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            return ESP_OK;
+        }
+        if (read_len == 0) {
+            break;
+        }
+        if (httpd_resp_send_chunk(req, chunk, read_len) != ESP_OK) {
+            break;
+        }
+    }
+    httpd_resp_send_chunk(req, NULL, 0);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------------------
+ * POST /bos/control: the server->BR->mesh control on-ramp. A LAN client
+ * (the site server) posts one control intent; the BR emits ONE CoAP control
+ * event onto the Thread mesh so matching devices self-select and drive their
+ * outputs instantly (server -> BR -> CoAP -> device).
+ *
+ * The emitted CoAP message is byte-identical to the device-originated emit in
+ * firmware/xiao-esp32c6/components/mesh_coap/mesh_coap.c
+ * (mesh_coap_emit_control_event + mesh_coap_event_format): a NON-confirmable
+ * POST to the URI path "mesh/event", Content-Format JSON, sent to the
+ * realm-local all-nodes multicast ff03::1 on OT_DEFAULT_COAP_PORT, with NO
+ * response handler. The JSON envelope carries exactly the fields the device's
+ * parse_event_envelope() reads back:
+ *   {"source_id":..., "action":..., "event_key":..., "control_id":...,
+ *    "target":{"spatial_id"|"tag"|"device_class"|"selector_ref"},
+ *    "parameters":{"level_milli":N}}
+ * source_id is required; the target object is emitted only when at least one
+ * selector is present; parameters.level_milli is 0..1000 (the device also
+ * accepts a top-level/parameters "level" 0..100 pct, parse_event_level()).
+ *
+ * Request body (application/json):
+ *   {"target": "<selector>"            (string -> envelope selector_ref) OR
+ *              {"spatial_id"|"tag"|"device_class"|"selector_ref": "..."},
+ *    "action": "on"|"off"|"dim",
+ *    "level":  0..1000 (milli, default) | 0..100 with "level_unit":"pct",
+ *    "source_id": "<origin id>"        (optional, defaults to "br-control"),
+ *    "priority": 0..10                 (optional; receiver-side concern, NOT
+ *                                       part of the device envelope, so it is
+ *                                       accepted but not placed on the wire)}
+ *
+ * Auth: token-gated write, same trust anchor as /bos/commission and the other
+ * BR write routes (bos_commissioning_request_authorized).
+ * ------------------------------------------------------------------------ */
+
+/* Realm-local all-nodes multicast (ff03::1), the exact destination
+ * mesh_coap.c fill_realm_local_all_nodes() builds for the device emit.
+ * Selector matching is receiver-side, so a control event is multicast. */
+static void control_fill_realm_local_all_nodes(otIp6Address *addr)
+{
+    memset(addr, 0, sizeof(*addr));
+    addr->mFields.m8[0] = 0xffU;
+    addr->mFields.m8[1] = 0x03U;
+    addr->mFields.m8[15] = 0x01U;
+}
+
+/* Map a "target" request field (string selector_ref, or an object carrying
+ * spatial_id/tag/device_class/selector_ref) into the envelope "target"
+ * object, mirroring the device's parse_event_envelope() shape. Returns false
+ * only on an out-of-memory cJSON failure; an absent/empty target is allowed
+ * (no target object, broadcast intent). */
+static bool control_build_target(const cJSON *target_in, cJSON *envelope)
+{
+    if (cJSON_IsString(target_in) && target_in->valuestring && target_in->valuestring[0] != '\0') {
+        cJSON *target = cJSON_CreateObject();
+        if (!target) {
+            return false;
+        }
+        /* A bare string is a selector_ref: parse_event_envelope() reads
+         * target.selector_ref (and falls back to a top-level selector_ref). */
+        cJSON_AddStringToObject(target, "selector_ref", target_in->valuestring);
+        cJSON_AddItemToObject(envelope, "target", target);
+        return true;
+    }
+    if (cJSON_IsObject(target_in)) {
+        cJSON *target = cJSON_CreateObject();
+        if (!target) {
+            return false;
+        }
+        static const char *const keys[] = {"eui64", "spatial_id", "tag", "device_class", "selector_ref"};
+        bool any = false;
+        for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+            const cJSON *v = cJSON_GetObjectItemCaseSensitive(target_in, keys[i]);
+            if (cJSON_IsString(v) && v->valuestring && v->valuestring[0] != '\0') {
+                cJSON_AddStringToObject(target, keys[i], v->valuestring);
+                any = true;
+            }
+        }
+        if (!any) {
+            cJSON_Delete(target);
+            return true; /* object with no usable selector: treat as broadcast */
+        }
+        cJSON_AddItemToObject(envelope, "target", target);
+        return true;
+    }
+    return true; /* no target: broadcast intent */
+}
+
+/* Send the control envelope JSON onto the mesh as a NON CoAP POST to
+ * mesh/event @ ff03::1, mirroring mesh_coap_emit_control_event() exactly.
+ * Runs the OT calls under the held esp_openthread lock (the otInstance is
+ * owned under that lock on the BR, same pattern as every other route here).
+ * Returns OT_ERROR_NONE on a queued send. */
+static otError control_emit_event(const char *payload, size_t payload_len)
+{
+    if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(2000))) {
+        return OT_ERROR_BUSY;
+    }
+    otInstance *instance = esp_openthread_get_instance();
+    if (!otInstanceIsInitialized(instance)) {
+        esp_openthread_lock_release();
+        return OT_ERROR_INVALID_STATE;
+    }
+
+    otMessage *request = otCoapNewMessage(instance, NULL);
+    if (!request) {
+        esp_openthread_lock_release();
+        return OT_ERROR_NO_BUFS;
+    }
+
+    /* NON-confirmable POST, identical to the device emit. */
+    otCoapMessageInit(request, OT_COAP_TYPE_NON_CONFIRMABLE, OT_COAP_CODE_POST);
+    otError err = otCoapMessageAppendUriPathOptions(request, "mesh/event");
+    if (err == OT_ERROR_NONE) {
+        err = otCoapMessageAppendContentFormatOption(request, OT_COAP_OPTION_CONTENT_FORMAT_JSON);
+    }
+    if (err == OT_ERROR_NONE) {
+        err = otCoapMessageSetPayloadMarker(request);
+    }
+    if (err == OT_ERROR_NONE) {
+        err = otMessageAppend(request, payload, (uint16_t)payload_len);
+    }
+    if (err == OT_ERROR_NONE) {
+        otMessageInfo info;
+        memset(&info, 0, sizeof(info));
+        control_fill_realm_local_all_nodes(&info.mPeerAddr);
+        info.mPeerPort = OT_DEFAULT_COAP_PORT;
+        /* No response handler: NON multicast has no single responder. */
+        err = otCoapSendRequest(instance, request, &info, NULL, NULL);
+    }
+    if (err != OT_ERROR_NONE) {
+        otMessageFree(request);
+    }
+
+    esp_openthread_lock_release();
+    return err;
+}
+
+static esp_err_t control_post_handler(httpd_req_t *req)
+{
+    if (!bos_commissioning_request_authorized(req)) {
+        return send_unauthorized(req);
+    }
+
+    char body[512];
+    if (read_request_body(req, body, sizeof(body)) < 0) {
+        return send_status_json(req, "400 Bad Request", "empty or oversized body");
+    }
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        return send_status_json(req, "400 Bad Request", "invalid JSON");
+    }
+
+    /* action (optional in the envelope, but required for a meaningful control
+     * intent): on|off|dim. */
+    const cJSON *action_j = cJSON_GetObjectItemCaseSensitive(root, "action");
+    if (!cJSON_IsString(action_j) || !action_j->valuestring) {
+        cJSON_Delete(root);
+        return send_status_json(req, "400 Bad Request", "action must be a string (on|off|dim)");
+    }
+    const char *action = action_j->valuestring;
+    if (strcmp(action, "on") != 0 && strcmp(action, "off") != 0 && strcmp(action, "dim") != 0) {
+        cJSON_Delete(root);
+        return send_status_json(req, "400 Bad Request", "action must be one of on|off|dim");
+    }
+
+    /* level: device units are milli (0..1000). Accept pct (0..100) when
+     * "level_unit":"pct" and convert to milli, matching parse_event_level()'s
+     * own level->level_milli conversion (level * 10). */
+    bool has_level = false;
+    long level_milli = 0;
+    const cJSON *level_j = cJSON_GetObjectItemCaseSensitive(root, "level");
+    if (cJSON_IsNumber(level_j)) {
+        const cJSON *unit_j = cJSON_GetObjectItemCaseSensitive(root, "level_unit");
+        bool pct = cJSON_IsString(unit_j) && unit_j->valuestring && strcmp(unit_j->valuestring, "pct") == 0;
+        double v = level_j->valuedouble;
+        if (pct) {
+            if (v < 0.0 || v > 100.0) {
+                cJSON_Delete(root);
+                return send_status_json(req, "400 Bad Request", "level (pct) out of range 0..100");
+            }
+            level_milli = (long)(v * 10.0 + 0.5);
+        } else {
+            if (v < 0.0 || v > 1000.0) {
+                cJSON_Delete(root);
+                return send_status_json(req, "400 Bad Request", "level (milli) out of range 0..1000");
+            }
+            level_milli = (long)(v + 0.5);
+        }
+        has_level = true;
+    }
+
+    /* source_id: required by the device envelope. Default to a stable BR id so
+     * the simplest control POST still parses receiver-side. */
+    const cJSON *source_j = cJSON_GetObjectItemCaseSensitive(root, "source_id");
+    const char *source_id = (cJSON_IsString(source_j) && source_j->valuestring && source_j->valuestring[0] != '\0')
+                                ? source_j->valuestring
+                                : "br-control";
+
+    /* priority: the 0..10 stacking band the inline operator command wins at.
+     * The device's inline command REQUIRES it. Default to 2 (manual operator
+     * override - strong, leaving lower bands for safety/critical sources). */
+    long priority = 2;
+    const cJSON *prio_j = cJSON_GetObjectItemCaseSensitive(root, "priority");
+    if (cJSON_IsNumber(prio_j)) {
+        double p = prio_j->valuedouble;
+        if (p < 0.0 || p > 10.0) {
+            cJSON_Delete(root);
+            return send_status_json(req, "400 Bad Request", "priority out of range 0..10");
+        }
+        priority = (long)(p + 0.5);
+    }
+
+    /* Map the request action (on|off|dim) to the device inline-command action
+     * (lighting.dim|lighting.off) and resolve the level. The device drives the
+     * dimmer DIRECTLY from this inline command - no compiled binding needed:
+     *   dim -> lighting.dim, requires a level
+     *   on  -> lighting.dim at full (1000 milli)
+     *   off -> lighting.off, no level */
+    const char *cmd_action;
+    if (strcmp(action, "off") == 0) {
+        cmd_action = "lighting.off";
+        has_level = false;
+    } else if (strcmp(action, "on") == 0) {
+        cmd_action = "lighting.dim";
+        level_milli = 1000;
+        has_level = true;
+    } else { /* dim */
+        cmd_action = "lighting.dim";
+        if (!has_level) {
+            cJSON_Delete(root);
+            return send_status_json(req, "400 Bad Request",
+                                    "dim requires a level (0..1000 milli, or 0..100 with level_unit=pct)");
+        }
+    }
+
+    /* Build the envelope in the device's exact inline-operator-command shape:
+     * source_id + optional event_key/control_id + target + command{action,
+     * level_milli?, priority}. The top-level action / parameters (the compiled-
+     * binding matcher path) are intentionally omitted; the inline command IS the
+     * drive, and the device's inline path ignores top-level action/parameters. */
+    cJSON *envelope = cJSON_CreateObject();
+    if (!envelope) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_OK;
+    }
+    cJSON_AddStringToObject(envelope, "source_id", source_id);
+    const cJSON *event_key_j = cJSON_GetObjectItemCaseSensitive(root, "event_key");
+    if (cJSON_IsString(event_key_j) && event_key_j->valuestring && event_key_j->valuestring[0] != '\0') {
+        cJSON_AddStringToObject(envelope, "event_key", event_key_j->valuestring);
+    }
+    const cJSON *control_id_j = cJSON_GetObjectItemCaseSensitive(root, "control_id");
+    if (cJSON_IsString(control_id_j) && control_id_j->valuestring && control_id_j->valuestring[0] != '\0') {
+        cJSON_AddStringToObject(envelope, "control_id", control_id_j->valuestring);
+    }
+    if (!control_build_target(cJSON_GetObjectItemCaseSensitive(root, "target"), envelope)) {
+        cJSON_Delete(envelope);
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_OK;
+    }
+    cJSON *command = cJSON_CreateObject();
+    if (!command) {
+        cJSON_Delete(envelope);
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_OK;
+    }
+    cJSON_AddStringToObject(command, "action", cmd_action);
+    if (has_level) {
+        cJSON_AddNumberToObject(command, "level_milli", (double)level_milli);
+    }
+    cJSON_AddNumberToObject(command, "priority", (double)priority);
+    cJSON_AddItemToObject(envelope, "command", command);
+    cJSON_Delete(root);
+
+    char *payload = cJSON_PrintUnformatted(envelope);
+    cJSON_Delete(envelope);
+    if (!payload) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_OK;
+    }
+
+    otError err = control_emit_event(payload, strlen(payload));
+    ESP_LOGI(TAG, "control event emit -> mesh/event @ ff03::1: action=%s len=%u result=%s",
+             action, (unsigned)strlen(payload), otThreadErrorToString(err));
+
+    if (err != OT_ERROR_NONE) {
+        char errjson[160];
+        snprintf(errjson, sizeof(errjson),
+                 "{\"ok\":false,\"error\":\"coap send failed\",\"ot_error\":\"%s\"}",
+                 otThreadErrorToString(err));
+        cJSON_free(payload);
+        httpd_resp_set_status(req, "502 Bad Gateway");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        httpd_resp_sendstr(req, errjson);
+        return ESP_OK;
+    }
+
+    /* Echo the exact envelope that was multicast so the caller can confirm the
+     * wire bytes. NON multicast has no per-device ack, so "matched" is
+     * receiver-side and not reported here. */
+    char respjson[640];
+    int written = snprintf(respjson, sizeof(respjson),
+                           "{\"ok\":true,\"emitted\":true,\"uri\":\"mesh/event\","
+                           "\"coap_type\":\"NON\",\"dest\":\"ff03::1\",\"envelope\":%s}",
+                           payload);
+    cJSON_free(payload);
+    if (written < 0 || written >= (int)sizeof(respjson)) {
+        /* Envelope echo too large for the buffer; still a successful emit. */
+        send_json(req, "{\"ok\":true,\"emitted\":true,\"uri\":\"mesh/event\",\"coap_type\":\"NON\",\"dest\":\"ff03::1\"}");
+        return ESP_OK;
+    }
+    send_json(req, respjson);
+    return ESP_OK;
+}
+
+static void ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    (void)arg;
+    if (event_base != IP_EVENT) {
+        return;
+    }
+
+    if (event_id == IP_EVENT_ETH_GOT_IP || event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        snprintf(s_backbone_if, sizeof(s_backbone_if), "%s", esp_netif_get_desc(event->esp_netif));
+        snprintf(s_backbone_ipv4, sizeof(s_backbone_ipv4), IPSTR, IP2STR(&event->ip_info.ip));
+        s_backbone_has_ipv4 = true;
+    } else if (event_id == IP_EVENT_GOT_IP6) {
+        ip_event_got_ip6_t *event = (ip_event_got_ip6_t *)event_data;
+        if (!is_backbone_netif(event->esp_netif)) {
+            return;
+        }
+        snprintf(s_backbone_if, sizeof(s_backbone_if), "%s", esp_netif_get_desc(event->esp_netif));
+        snprintf(s_backbone_ipv6,
+                 sizeof(s_backbone_ipv6),
+                 IPV6STR,
+                 IPV62STR(event->ip6_info.ip));
+        s_backbone_has_ipv6 = true;
+    }
+}
+
+static void eth_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    (void)arg;
+    (void)event_base;
+    (void)event_data;
+
+    if (event_id == ETHERNET_EVENT_CONNECTED) {
+        s_backbone_link_up = true;
+    } else if (event_id == ETHERNET_EVENT_DISCONNECTED || event_id == ETHERNET_EVENT_STOP) {
+        s_backbone_link_up = false;
+        s_backbone_has_ipv4 = false;
+        s_backbone_has_ipv6 = false;
+        s_backbone_ipv4[0] = '\0';
+        s_backbone_ipv6[0] = '\0';
+    }
+}
+
+esp_err_t bos_diagnostics_server_start(void)
+{
+    if (s_registered) {
+        return ESP_OK;
+    }
+
+    ESP_RETURN_ON_ERROR(bos_br_ota_init(), TAG, "failed to initialize BR OTA routes");
+
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, ip_event_handler, NULL),
+                        TAG,
+                        "failed to register IP event handler");
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, eth_event_handler, NULL),
+                        TAG,
+                        "failed to register Ethernet event handler");
+
+    httpd_uri_t status_uri = {
+        .uri = "/bos/status",
+        .method = HTTP_GET,
+        .handler = status_get_handler,
+        .user_ctx = NULL,
+    };
+    /* Unauthenticated read-only GET, same boundary as /bos/status. */
+    httpd_uri_t thread_diag_uri = {
+        .uri = "/bos/thread-diag",
+        .method = HTTP_GET,
+        .handler = thread_diag_get_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t ledger_uri = {
+        .uri = "/bos/ledger/active",
+        .method = HTTP_GET,
+        .handler = ledger_active_get_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t ledger_push_uri = {
+        .uri = "/bos/ledger/push",
+        .method = HTTP_POST,
+        .handler = ledger_push_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t commission_uri = {
+        .uri = "/bos/commission",
+        .method = HTTP_POST,
+        .handler = bos_commissioning_http_post,
+        .user_ctx = NULL,
+    };
+    /* The site server CommissioningService.imprint() hardcodes
+     * POST /api/commission (host/runtime/server/src/commissioning.ts); keep
+     * that path as an alias of the LAN-direct route so the existing imprint
+     * sender reaches the BR unmodified. */
+    httpd_uri_t commission_alias_uri = {
+        .uri = "/api/commission",
+        .method = HTTP_POST,
+        .handler = bos_commissioning_http_post,
+        .user_ctx = NULL,
+    };
+    /* Commissioning phase 2b joiner acceptance (docs/06.2 phase 2b); handlers
+     * and auth in bos_commissioning/bos_joiner.c. */
+    httpd_uri_t joiner_accept_uri = {
+        .uri = "/bos/joiner/accept",
+        .method = HTTP_POST,
+        .handler = bos_joiner_accept_http_post,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t joiner_status_uri = {
+        .uri = "/bos/joiner/status",
+        .method = HTTP_GET,
+        .handler = bos_joiner_status_http_get,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t ledger_torrent_uri = {
+        .uri = "/bos/ledger/torrent",
+        .method = HTTP_GET,
+        .handler = ledger_torrent_get_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t convergence_uri = {
+        .uri = "/bos/convergence",
+        .method = HTTP_GET,
+        .handler = convergence_get_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t peers_uri = {
+        .uri = "/bos/peers",
+        .method = HTTP_GET,
+        .handler = peers_get_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t ota_status_uri = {
+        .uri = "/bos/ota/status",
+        .method = HTTP_GET,
+        .handler = bos_br_ota_http_status,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t ota_upload_uri = {
+        .uri = "/bos/ota/app",
+        .method = HTTP_POST,
+        .handler = bos_br_ota_http_upload,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t ota_fetch_uri = {
+        .uri = "/bos/ota/app/fetch",
+        .method = HTTP_POST,
+        .handler = bos_br_ota_http_fetch,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t ota_confirm_uri = {
+        .uri = "/bos/ota/confirm",
+        .method = HTTP_POST,
+        .handler = bos_br_ota_http_confirm,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t ota_rollback_uri = {
+        .uri = "/bos/ota/rollback",
+        .method = HTTP_POST,
+        .handler = bos_br_ota_http_rollback,
+        .user_ctx = NULL,
+    };
+    /* BR 802.15.4 radio window: open read, token-authed live TX-power set. */
+    httpd_uri_t radio_get_uri = {
+        .uri = "/bos/radio",
+        .method = HTTP_GET,
+        .handler = radio_get_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t radio_post_uri = {
+        .uri = "/bos/radio",
+        .method = HTTP_POST,
+        .handler = radio_post_handler,
+        .user_ctx = NULL,
+    };
+    /* Neighbor/link-quality table; shared bos_thread_diag renderer. */
+    httpd_uri_t thread_neighbors_uri = {
+        .uri = "/bos/thread-neighbors",
+        .method = HTTP_GET,
+        .handler = thread_neighbors_get_handler,
+        .user_ctx = NULL,
+    };
+    /* Wedged-RCP recovery lever; token-authed. */
+    httpd_uri_t thread_reset_uri = {
+        .uri = "/bos/thread-reset",
+        .method = HTTP_POST,
+        .handler = thread_reset_post_handler,
+        .user_ctx = NULL,
+    };
+    /* Device-UI proxy. Wildcard URIs (the server runs httpd_uri_match_wildcard);
+     * these register BEFORE the upstream catch-all slash-star GET handler
+     * because external handlers are stored here at init and flushed to httpd
+     * ahead of the default route when the server starts on the IP event. One
+     * URI slot per method. */
+    httpd_uri_t device_proxy_get_uri = {
+        .uri = BOS_PROXY_URI_PREFIX "*",
+        .method = HTTP_GET,
+        .handler = device_proxy_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t device_proxy_put_uri = {
+        .uri = BOS_PROXY_URI_PREFIX "*",
+        .method = HTTP_PUT,
+        .handler = device_proxy_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t device_proxy_post_uri = {
+        .uri = BOS_PROXY_URI_PREFIX "*",
+        .method = HTTP_POST,
+        .handler = device_proxy_handler,
+        .user_ctx = NULL,
+    };
+    /* Server->BR->mesh control on-ramp: emits ONE CoAP control event onto the
+     * mesh (mesh/event @ ff03::1, NON POST), byte-identical to the device's
+     * own emit. Token-authed write, same trust anchor as /bos/commission. */
+    httpd_uri_t control_post_uri = {
+        .uri = "/bos/control",
+        .method = HTTP_POST,
+        .handler = control_post_handler,
+        .user_ctx = NULL,
+    };
+
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&status_uri), TAG, "failed to register /bos/status");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&thread_diag_uri), TAG, "failed to register /bos/thread-diag");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&ledger_uri), TAG, "failed to register /bos/ledger/active");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&ledger_push_uri), TAG, "failed to register /bos/ledger/push");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&commission_uri), TAG, "failed to register /bos/commission");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&commission_alias_uri), TAG, "failed to register /api/commission");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&joiner_accept_uri), TAG, "failed to register /bos/joiner/accept");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&joiner_status_uri), TAG, "failed to register /bos/joiner/status");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&ledger_torrent_uri), TAG, "failed to register /bos/ledger/torrent");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&convergence_uri), TAG, "failed to register /bos/convergence");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&peers_uri), TAG, "failed to register /bos/peers");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&ota_status_uri), TAG, "failed to register /bos/ota/status");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&ota_upload_uri), TAG, "failed to register /bos/ota/app");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&ota_fetch_uri), TAG, "failed to register /bos/ota/app/fetch");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&ota_confirm_uri), TAG, "failed to register /bos/ota/confirm");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&ota_rollback_uri), TAG, "failed to register /bos/ota/rollback");
+    /* Route-slot budget (esp_br_web.c BOS_EXTERNAL_HANDLER_MAX; route 17 past
+     * the old cap of 16 broke the 0.1.4 OTA): this function now performs 24
+     * registrations (the 23 prior routes plus POST /bos/control). The cap was
+     * raised from 24 to 26 in esp_br_web.c alongside this route so a free slot
+     * margin is preserved; the next new route must either use that margin
+     * deliberately or raise the cap again. */
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&radio_get_uri), TAG, "failed to register GET /bos/radio");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&radio_post_uri), TAG, "failed to register POST /bos/radio");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&thread_neighbors_uri), TAG, "failed to register /bos/thread-neighbors");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&thread_reset_uri), TAG, "failed to register /bos/thread-reset");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&device_proxy_get_uri), TAG, "failed to register GET /bos/device/*");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&device_proxy_put_uri), TAG, "failed to register PUT /bos/device/*");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&device_proxy_post_uri), TAG, "failed to register POST /bos/device/*");
+    ESP_RETURN_ON_ERROR(esp_br_web_register_handler(&control_post_uri), TAG, "failed to register POST /bos/control");
+
+    s_registered = true;
+    esp_err_t confirm_err = bos_br_ota_confirm_running_app();
+    if (confirm_err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "failed to confirm running OTA image after diagnostics route registration: %s",
+                 esp_err_to_name(confirm_err));
+    }
+    ESP_LOGI(TAG, "Building OS diagnostics routes registered on BR port 80");
+    return ESP_OK;
+}

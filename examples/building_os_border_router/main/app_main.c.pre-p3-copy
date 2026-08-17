@@ -1,0 +1,341 @@
+/**
+ * Building OS Border Router firmware, entry point.
+ *
+ * Boot sequence per docs/08.8-border-router.md section 8.1:
+ *   init -> network_wait -> discovering -> registering -> operating
+ *
+ * This file wires the upstream esp-thread-br stack and the bos_* components.
+ * Stub status of each component is in the README.
+ */
+
+#include "driver/uart.h"
+#include "esp_check.h"
+#include "esp_err.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_openthread.h"
+#include "esp_openthread_border_router.h"
+#include "esp_openthread_lock.h"
+#include "esp_openthread_netif_glue.h"
+#include "esp_spiffs.h"
+#include "esp_system.h"
+#include "esp_vfs_eventfd.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "mdns.h"
+#include "nvs_flash.h"
+#include "protocol_examples_common.h"
+#include "sdkconfig.h"
+
+#include "openthread/dnssd_server.h"
+#include "openthread/platform/radio.h"
+#include "openthread/srp_server.h"
+
+#include "border_router_launch.h"
+#include "bos_convergence_aggregator.h"
+#include "bos_diagnostics_server.h"
+#include "bos_ledger_ingress.h"
+#include "bos_ledger_mesh_serve.h"
+#include "bos_server_registration.h"
+#include "bos_thread_dataset_anchor.h"
+#include "esp_br_web.h"
+#include "esp_ot_config.h"
+
+static const char *TAG = "bos_br";
+
+static esp_err_t init_nvs(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS partition changed, erasing");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    return err;
+}
+
+static esp_err_t init_spiffs(void)
+{
+#if CONFIG_AUTO_UPDATE_RCP
+    esp_vfs_spiffs_conf_t rcp_fw_conf = {
+        .base_path = "/" CONFIG_RCP_PARTITION_NAME,
+        .partition_label = CONFIG_RCP_PARTITION_NAME,
+        .max_files = 10,
+        .format_if_mount_failed = false,
+    };
+    ESP_RETURN_ON_ERROR(esp_vfs_spiffs_register(&rcp_fw_conf),
+                        TAG,
+                        "Failed to mount RCP firmware storage");
+#endif
+
+#if CONFIG_OPENTHREAD_BR_START_WEB
+    esp_vfs_spiffs_conf_t web_conf = {
+        .base_path = "/spiffs",
+        .partition_label = "web_storage",
+        .max_files = 10,
+        .format_if_mount_failed = false,
+    };
+    ESP_RETURN_ON_ERROR(esp_vfs_spiffs_register(&web_conf),
+                        TAG,
+                        "Failed to mount web storage");
+#endif
+
+    return ESP_OK;
+}
+
+/* Logged fatal for true must-succeed init paths (eventfd/nvs/spiffs/netif/
+ * event-loop). sdkconfig has PANIC_PRINT_REBOOT with REBOOT_DELAY 0, so a raw
+ * ESP_ERROR_CHECK abort reboots before the USB-Serial-JTAG console can show
+ * anything - the BR just "vanishes". Log loudly, hold 10 s so the banner is
+ * capturable, then restart. Never a silent fallback. */
+static void bos_fatal_check(esp_err_t err, const char *what)
+{
+    if (err == ESP_OK) {
+        return;
+    }
+    ESP_LOGE(TAG, "FATAL: %s failed: %s; restarting in 10 s", what, esp_err_to_name(err));
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    esp_restart();
+}
+
+static void log_bos_init_result(const char *name, esp_err_t err)
+{
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s failed: %s; continuing with upstream border-router bring-up", name, esp_err_to_name(err));
+    }
+}
+
+static void init_bos_components_log_only(void)
+{
+    log_bos_init_result("bos_thread_dataset_anchor_init", bos_thread_dataset_anchor_init());
+    log_bos_init_result("bos_server_registration_init", bos_server_registration_init());
+    log_bos_init_result("bos_ledger_ingress_init", bos_ledger_ingress_init());
+    log_bos_init_result("bos_convergence_aggregator_init", bos_convergence_aggregator_init());
+}
+
+#if !CONFIG_EXAMPLE_CONNECT_ETHERNET
+#error "The BOS BR backbone is the wired control LAN (docs/08.8-border-router.md section 11); enable CONFIG_EXAMPLE_CONNECT_ETHERNET."
+#endif
+
+/* BOS Thread bring-up. Replaces the upstream CONFIG_OPENTHREAD_BR_AUTO_START
+ * task (examples/common/thread_border_router ot_br_init), which is disabled
+ * in sdkconfig: the upstream path forms an anonymous random network outside
+ * the documented commissioning model. Here the dataset lifecycle is owned by
+ * bos_thread_dataset_anchor_apply_or_form() (apply persisted dataset, else
+ * form once and persist), per docs/06.2-commissioning-workflow.md phase 2b
+ * and docs/08.8-border-router.md section 11.
+ *
+ * Diagnosis fix 2026-06-13 (docs/scratch/br-diagnosis.md findings #1/#2):
+ * backbone connect + esp_openthread_set_backbone_netif() now happen in
+ * app_main() BEFORE launch_openthread_border_router() reaches
+ * esp_openthread_init() (Espressif requires set-before-init). This task only
+ * does the post-init border-router work, with logged errors and bounded
+ * retry instead of ESP_ERROR_CHECK so a transient fault cannot abort into
+ * an instant invisible reboot (PANIC_REBOOT_DELAY=0). */
+static void bos_thread_bringup_task(void *ctx)
+{
+    (void)ctx;
+
+    const int max_attempts = 5;
+    bool br_init_done = false;
+    esp_err_t err = ESP_FAIL;
+
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        esp_openthread_lock_acquire(portMAX_DELAY);
+        if (!br_init_done) {
+            err = esp_openthread_border_router_init();
+            if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
+                /* INVALID_STATE = already initialised on a retry pass. */
+                br_init_done = true;
+                err = ESP_OK;
+            } else {
+                ESP_LOGE(TAG, "esp_openthread_border_router_init failed (attempt %d/%d): %s",
+                         attempt, max_attempts, esp_err_to_name(err));
+            }
+        }
+        if (br_init_done) {
+            err = bos_thread_dataset_anchor_apply_or_form();
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "bos_thread_dataset_anchor_apply_or_form failed (attempt %d/%d): %s",
+                         attempt, max_attempts, esp_err_to_name(err));
+            }
+        }
+        esp_openthread_lock_release();
+
+        if (err == ESP_OK) {
+            break;
+        }
+        if (attempt < max_attempts) {
+            vTaskDelay(pdMS_TO_TICKS(5000U * (uint32_t)attempt));
+        }
+    }
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Thread BR bring-up failed after %d attempts: %s; "
+                      "staying up degraded (HTTP/diagnostics remain live, no reboot)",
+                 max_attempts, esp_err_to_name(err));
+    }
+
+    /* H2 802.15.4 TX power assert (rebuild of the lost 0.1.6/0.1.7 fix,
+     * docs/scratch/br-range-and-fork-review-2026-06-12.md): the H2 RCP
+     * defaults to ~0 dBm and the BR otherwise runs ~20 dB below ceiling -
+     * the lever that closed the cross-building join. Set at this safe point,
+     * post-OT-init under the held OT lock. Runtime changes go through
+     * POST /bos/radio; this is the boot default only. */
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    {
+        otInstance *instance = esp_openthread_get_instance();
+        int8_t tx_before = 0;
+        int8_t tx_after = 0;
+        otError tx_err = otPlatRadioGetTransmitPower(instance, &tx_before);
+        if (tx_err != OT_ERROR_NONE) {
+            ESP_LOGW(TAG, "802.15.4 TX power read failed before set: %d", (int)tx_err);
+        }
+        tx_err = otPlatRadioSetTransmitPower(instance, 20);
+        if (tx_err == OT_ERROR_NONE) {
+            if (otPlatRadioGetTransmitPower(instance, &tx_after) != OT_ERROR_NONE) {
+                tx_after = 20;
+            }
+            ESP_LOGI(TAG, "802.15.4 TX power was %d, now %d", (int)tx_before, (int)tx_after);
+        } else {
+            ESP_LOGW(TAG, "802.15.4 TX power set to 20 dBm failed: %d (radio stays at %d)",
+                     (int)tx_err, (int)tx_before);
+        }
+
+        /* Bench root-cause 2026-06-13 (jobs.md night-shift header): the host
+         * deadlocks in the prebuilt resolver's upstream DNS forward path the
+         * moment any joined Thread device sends DNS queries ("Resolver:
+         * Forward DNS query to v4: ..." then host-wide wedge; reproduced 3x,
+         * idle-leader is stable). The forwarder lives in libopenthread_br.a
+         * so the wedge is unpatchable here; disable upstream forwarding -
+         * the dnssd server still answers SRP/local queries, and no Building
+         * OS path resolves LAN names through the BR. */
+        otDnssdUpstreamQuerySetEnabled(instance, false);
+        ESP_LOGI(TAG, "DNS upstream query forwarding disabled (enabled=%d)",
+                 (int)otDnssdUpstreamQueryIsEnabled(instance));
+    }
+    esp_openthread_lock_release();
+
+    vTaskDelete(NULL);
+}
+
+/* Ethernet backbone (W5500) connect with logged bounded retry
+ * (br-diagnosis.md finding #2: ESP_ERROR_CHECK(example_connect()) turned a
+ * transient W5500/SPI/DHCP fault into an instant abort+reboot). Returns the
+ * final example_connect() result; never aborts. */
+static esp_err_t bos_backbone_connect(void)
+{
+    const int max_attempts = 5;
+    esp_err_t err = ESP_FAIL;
+
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        err = example_connect();
+        if (err == ESP_OK) {
+            return ESP_OK;
+        }
+        ESP_LOGE(TAG, "example_connect failed (attempt %d/%d): %s",
+                 attempt, max_attempts, esp_err_to_name(err));
+        if (attempt < max_attempts) {
+            esp_err_t disc = example_disconnect();
+            if (disc != ESP_OK) {
+                ESP_LOGW(TAG, "example_disconnect during retry: %s", esp_err_to_name(disc));
+            }
+            vTaskDelay(pdMS_TO_TICKS(2000U * (uint32_t)attempt));
+        }
+    }
+    return err;
+}
+
+void app_main(void)
+{
+    size_t max_eventfd = 3;
+
+#if CONFIG_OPENTHREAD_RADIO_SPINEL_SPI
+    max_eventfd++;
+#endif
+#if CONFIG_OPENTHREAD_RADIO_TREL
+    max_eventfd++;
+#endif
+
+    esp_vfs_eventfd_config_t eventfd_config = {
+        .max_fds = max_eventfd,
+    };
+
+    esp_openthread_config_t openthread_config = {
+        .netif_config = ESP_NETIF_DEFAULT_OPENTHREAD(),
+        .platform_config = {
+            .radio_config = ESP_OPENTHREAD_DEFAULT_RADIO_CONFIG(),
+            .host_config = ESP_OPENTHREAD_DEFAULT_HOST_CONFIG(),
+            .port_config = ESP_OPENTHREAD_DEFAULT_PORT_CONFIG(),
+        },
+    };
+    esp_rcp_update_config_t rcp_update_config = ESP_OPENTHREAD_RCP_UPDATE_CONFIG();
+
+    ESP_LOGI(TAG, "Building OS Border Router firmware starting");
+
+    bos_fatal_check(esp_vfs_eventfd_register(&eventfd_config), "esp_vfs_eventfd_register");
+    bos_fatal_check(init_nvs(), "init_nvs");
+    bos_fatal_check(init_spiffs(), "init_spiffs");
+    bos_fatal_check(esp_netif_init(), "esp_netif_init");
+    bos_fatal_check(esp_event_loop_create_default(), "esp_event_loop_create_default");
+
+    /* mDNS is discovery convenience, not a reason to reboot the BR. */
+    esp_err_t mdns_err = mdns_init();
+    if (mdns_err == ESP_OK) {
+        mdns_err = mdns_hostname_set("esp-ot-br");
+    }
+    if (mdns_err != ESP_OK) {
+        ESP_LOGE(TAG, "mDNS setup failed: %s; continuing without mDNS", esp_err_to_name(mdns_err));
+    }
+
+#if CONFIG_OPENTHREAD_BR_START_WEB
+    esp_br_web_start("/spiffs");
+#endif
+
+    init_bos_components_log_only();
+    esp_err_t diag_err = bos_diagnostics_server_start();
+    if (diag_err != ESP_OK) {
+        ESP_LOGE(TAG, "bos_diagnostics_server_start failed: %s; continuing without /bos diagnostics",
+                 esp_err_to_name(diag_err));
+    }
+
+    /* Diagnosis fix (br-diagnosis.md finding #1): the backbone netif must be
+     * registered BEFORE launch_openthread_border_router() reaches
+     * esp_openthread_init() (via the openthread_start_compat shim), per the
+     * Espressif esp_openthread_set_backbone_netif contract. Connect the
+     * W5500 backbone first (logged bounded retry, no abort), then null-check
+     * the netif with a logged retry loop - never abort: a BR with no backbone
+     * stays up degraded and keeps its console/HTTP surface alive. The BOS IP
+     * event handlers above are registered before connect so no GOT_IP event
+     * is missed. */
+    esp_err_t backbone_err = bos_backbone_connect();
+    if (backbone_err != ESP_OK) {
+        ESP_LOGE(TAG, "backbone connect failed permanently: %s; launching Thread without backbone",
+                 esp_err_to_name(backbone_err));
+    }
+
+    esp_netif_t *backbone = get_example_netif();
+    for (int wait = 0; backbone == NULL && wait < 10; wait++) {
+        ESP_LOGE(TAG, "backbone netif unavailable (poll %d/10); retrying in 1 s", wait + 1);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        backbone = get_example_netif();
+    }
+    if (backbone != NULL) {
+        esp_openthread_set_backbone_netif(backbone);
+    } else {
+        ESP_LOGE(TAG, "no backbone netif; OpenThread will start without border routing backbone");
+    }
+
+    ESP_LOGI(TAG, "Building OS Border Router init complete; launching upstream OpenThread BR");
+    launch_openthread_border_router(&openthread_config, &rcp_update_config);
+
+    /* Same task shape as the upstream auto-start path (xTaskCreate of the
+     * bring-up after launch); the task body is BOS-owned, see above. */
+    if (xTaskCreate(bos_thread_bringup_task, "bos_thread_up", 6144, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "failed to create Thread bring-up task; mesh will not form");
+    }
+
+    log_bos_init_result("bos_ledger_mesh_serve_init", bos_ledger_mesh_serve_init());
+    log_bos_init_result("bos_convergence_aggregator_start", bos_convergence_aggregator_start());
+}

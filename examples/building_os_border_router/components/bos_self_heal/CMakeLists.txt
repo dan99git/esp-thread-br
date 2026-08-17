@@ -1,0 +1,16 @@
+idf_component_register(
+    SRCS
+        "bos_self_heal.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        bos_thread_diag
+        driver
+        esp_eth
+        esp_event
+        esp_netif
+        esp_system
+        esp_timer
+        freertos
+        protocol_examples_common
+)
