@@ -71,3 +71,6 @@ docs/_build
 # BOS bench build outputs and logs
 examples/building_os_border_router/build_*/
 examples/building_os_border_router/*.log
+
+# Building OS archive quarantine (never tracked)
+.archive/

@@ -22,6 +22,7 @@
 #include "bos_br_ota.h"
 #include "bos_ledger_ingress.h"
 #include "bos_ledger_mesh_serve.h"
+#include "bos_self_heal.h"
 #include "bos_server_registration.h"
 #include "cJSON.h"
 #include "esp_br_web.h"
@@ -192,7 +193,8 @@ esp_err_t status_get_handler(httpd_req_t *req)
         char ota_json[1536];
         char identity_json[1024];
         char thread_json[224];
-        char json[3840];
+        char self_heal_json[1280];
+        char json[5120];
     } status_json_buffers_t;
 
     status_json_buffers_t *buffers = (status_json_buffers_t *)calloc(1, sizeof(status_json_buffers_t));
@@ -258,6 +260,12 @@ esp_err_t status_get_handler(httpd_req_t *req)
     uint32_t hb_dropped = 0;
     bos_server_registration_heartbeat_stats(&hb_buffered, &hb_dropped);
 
+    /* Ethernet self-heal snapshot (bos_self_heal.h contract). Renders null
+     * when the monitor cannot fit its snapshot - honest-unavailable. */
+    if (bos_self_heal_json(buffers->self_heal_json, sizeof(buffers->self_heal_json)) < 0) {
+        snprintf(buffers->self_heal_json, sizeof(buffers->self_heal_json), "null");
+    }
+
     int written = snprintf(buffers->json,
                            sizeof(buffers->json),
                            "{\"device_class\":\"border_router\",\"firmware\":\"building-os-border-router\","
@@ -268,6 +276,7 @@ esp_err_t status_get_handler(httpd_req_t *req)
                            "\"backbone\":{\"connected\":%s,\"link_up\":%s,\"interface\":\"%s\","
                            "\"ipv4\":\"%s\",\"ipv6\":\"%s\"},"
                            "\"thread\":%s,"
+                           "\"self_heal\":%s,"
                            "\"rcp\":{\"target\":\"%s\",\"version\":\"not_polled\"},"
                            "\"ledger\":{\"state\":\"%s\",\"persist\":\"%s\",\"last_error\":%s},\"ota\":%s}",
                            buffers->firmware_version_json,
@@ -285,6 +294,7 @@ esp_err_t status_get_handler(httpd_req_t *req)
                            s_backbone_ipv4,
                            s_backbone_ipv6,
                            buffers->thread_json,
+                           buffers->self_heal_json,
 #if CONFIG_ESP_BR_H2_TARGET
                            "esp32h2",
 #elif CONFIG_ESP_BR_C6_TARGET

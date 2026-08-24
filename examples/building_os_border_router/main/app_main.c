@@ -39,6 +39,7 @@
 #include "bos_time.h"
 #include "bos_ledger_ingress.h"
 #include "bos_ledger_mesh_serve.h"
+#include "bos_self_heal.h"
 #include "bos_server_registration.h"
 #include "bos_thread_dataset_anchor.h"
 #include "esp_br_web.h"
@@ -332,6 +333,17 @@ void app_main(void)
     if (diag_err != ESP_OK) {
         ESP_LOGE(TAG, "bos_diagnostics_server_start failed: %s; continuing without /bos diagnostics",
                  esp_err_to_name(diag_err));
+    }
+
+    /* Ethernet self-heal monitor for the known "BR dark after reboot" failure
+     * (W5500 never acquires IPv4). Built 2026-06 but never started - boarded
+     * 2026-08-24. Event handlers registered here (event loop is up); the
+     * monitor arms itself once ETH events flow. A start failure loses
+     * recovery, not the BR, so it is log-only like the other bos components. */
+    esp_err_t self_heal_err = bos_self_heal_start();
+    if (self_heal_err != ESP_OK) {
+        ESP_LOGE(TAG, "bos_self_heal_start failed: %s; continuing without Ethernet self-heal",
+                 esp_err_to_name(self_heal_err));
     }
 
     /* Diagnosis fix (br-diagnosis.md finding #1): the backbone netif must be

@@ -5,6 +5,7 @@ idf_component_register(
     INCLUDE_DIRS
         "include"
     REQUIRES
+        bos_auth
         bos_server_registration
         esp_http_server
         esp_timer

@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "bos_auth.h"
 #include "bos_server_registration.h"
 #include "cJSON.h"
 #include "esp_http_client.h"
@@ -100,26 +101,8 @@ static esp_err_t header_value(httpd_req_t *req, const char *name, char *out, siz
 
 static bool request_authorized(httpd_req_t *req)
 {
-    char expected[BOS_BR_OTA_HEADER_VALUE_MAX];
-    char provided[BOS_BR_OTA_HEADER_VALUE_MAX];
-
-    if (bos_server_registration_get_token(expected, sizeof(expected)) == ESP_OK && expected[0] != '\0') {
-        if (header_value(req, "X-Device-Token", provided, sizeof(provided)) == ESP_OK &&
-            strcmp(expected, provided) == 0) {
-            return true;
-        }
-    }
-
-#ifdef CONFIG_BOS_SERVER_API_KEY
-    if (CONFIG_BOS_SERVER_API_KEY[0] != '\0') {
-        if (header_value(req, "x-api-key", provided, sizeof(provided)) == ESP_OK &&
-            strcmp(CONFIG_BOS_SERVER_API_KEY, provided) == 0) {
-            return true;
-        }
-    }
-#endif
-
-    return false;
+    /* Shared constant-time trust anchor (bos_auth, deduped 2026-08-24). */
+    return bos_auth_request_authorized(req);
 }
 
 static void send_json(httpd_req_t *req, const char *json)
