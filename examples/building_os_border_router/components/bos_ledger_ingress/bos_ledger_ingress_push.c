@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "bos_auth.h"
 #include "bos_server_registration.h"
 #include "esp_err.h"
 #include "esp_http_server.h"
@@ -116,37 +117,10 @@ esp_err_t push_send_conflict(httpd_req_t *req)
     return ESP_OK;
 }
 
-static esp_err_t header_value(httpd_req_t *req, const char *name, char *out, size_t out_len)
-{
-    size_t len = httpd_req_get_hdr_value_len(req, name);
-    if (len == 0 || len >= out_len) {
-        return ESP_ERR_NOT_FOUND;
-    }
-    return httpd_req_get_hdr_value_str(req, name, out, out_len);
-}
-
 static bool push_authorized(httpd_req_t *req)
 {
-    char expected[BOS_LEDGER_HEADER_TOKEN_MAX];
-    char provided[BOS_LEDGER_HEADER_TOKEN_MAX];
-
-    if (bos_server_registration_get_token(expected, sizeof(expected)) == ESP_OK && expected[0] != '\0') {
-        if (header_value(req, "X-Device-Token", provided, sizeof(provided)) == ESP_OK &&
-            strcmp(expected, provided) == 0) {
-            return true;
-        }
-    }
-
-#ifdef CONFIG_BOS_SERVER_API_KEY
-    if (CONFIG_BOS_SERVER_API_KEY[0] != '\0') {
-        if (header_value(req, "x-api-key", provided, sizeof(provided)) == ESP_OK &&
-            strcmp(CONFIG_BOS_SERVER_API_KEY, provided) == 0) {
-            return true;
-        }
-    }
-#endif
-
-    return false;
+    /* Shared constant-time trust anchor (bos_auth, deduped 2026-08-24). */
+    return bos_auth_request_authorized(req);
 }
 
 esp_err_t write_staged_partition(const esp_partition_t *partition,

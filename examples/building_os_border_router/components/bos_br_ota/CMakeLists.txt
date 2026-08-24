@@ -7,6 +7,7 @@ idf_component_register(
     REQUIRES
         app_update
         bootloader_support
+        bos_auth
         bos_server_registration
         esp_app_format
         esp_http_client

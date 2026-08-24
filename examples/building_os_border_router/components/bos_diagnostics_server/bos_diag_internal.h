@@ -40,7 +40,7 @@ extern "C" {
 #define BOS_PHONEBOOK_DEVICE_CLASS_MAX 48
 #define BOS_PHONEBOOK_TAGS_MAX 160
 #define BOS_PHONEBOOK_COORD_MAX 32
-/* v3 operational book (phonebook v3, 17 columns, exact order). This is the
+/* v3 operational book (phonebook v3, 18 columns, exact order). This is the
  * ONLY accepted format: a v2 (14-col) or v1 (9-col) document hard-rejects at
  * the magic line and again at the column-header cross-check - no silent
  * fallback. v3 rows carry make/model/model_id/photometry in the stored raw
@@ -66,7 +66,7 @@ typedef struct {
 
 typedef struct {
     bool loaded;
-    int columns_version; /* 3 = 17-col v3 (only accepted format) */
+    int columns_version; /* 3 = 18-col v3 (only accepted format) */
     char version[BOS_PHONEBOOK_VERSION_MAX];
     char digest[BOS_PHONEBOOK_DIGEST_MAX];
     char generated_at[BOS_PHONEBOOK_GENERATED_AT_MAX];

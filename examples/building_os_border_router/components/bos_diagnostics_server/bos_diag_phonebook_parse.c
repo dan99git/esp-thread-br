@@ -192,7 +192,7 @@ static esp_err_t phonebook_parse_comment_header(const char *line,
     char digest[BOS_PHONEBOOK_DIGEST_MAX] = "";
     char generated_at[BOS_PHONEBOOK_GENERATED_AT_MAX] = "";
     char extra = '\0';
-    /* v3 magic only ("bos-phonebook-v3", 17-col docs). A v2 ("bos-phonebook-v2")
+    /* v3 magic only ("bos-phonebook-v3", 18-col contract). A v2 ("bos-phonebook-v2")
      * or v1 ("bos-phonebook") magic fails this literal sscanf and is rejected
      * here with NO fallback. The version seen is recorded in
      * book->columns_version and cross-checked against the column-header line by
@@ -358,7 +358,7 @@ esp_err_t phonebook_parse_csv(const char *raw,
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* v3 only: the column header must be the exact 17-col v3 literal. A v2
+    /* v3 only: the column header must be the exact 18-col v3 literal. A v2
      * (14-col) or v1 (9-col) header fails this and is rejected here - the
      * second, independent rejection point after the magic line. */
     size_t columns_len = strlen(BOS_PHONEBOOK_COLUMNS_V3);
@@ -372,7 +372,7 @@ esp_err_t phonebook_parse_csv(const char *raw,
         return ESP_ERR_INVALID_ARG;
     }
     /* The magic recorded from line 1 must agree with the column header:
-     * v3 magic requires the 17-col line. */
+     * v3 magic requires the 18-col line. */
     if (columns_version != book->columns_version) {
         snprintf(error, error_len, "phonebook: magic/column header version mismatch");
         free(hash_body);

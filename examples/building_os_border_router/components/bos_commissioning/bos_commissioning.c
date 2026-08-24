@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "bos_auth.h"
 #include "bos_server_registration.h"
 #include "cJSON.h"
 #include "esp_err.h"
@@ -22,15 +23,6 @@ static const char *TAG = "bos_commission";
 #define BOS_COMMISSION_BODY_MAX 2048U
 #define BOS_COMMISSION_TOKEN_MAX 128
 
-static esp_err_t header_value(httpd_req_t *req, const char *name, char *out, size_t out_len)
-{
-    size_t len = httpd_req_get_hdr_value_len(req, name);
-    if (len == 0 || len >= out_len) {
-        return ESP_ERR_NOT_FOUND;
-    }
-    return httpd_req_get_hdr_value_str(req, name, out, out_len);
-}
-
 /* Same trust anchor as /bos/ledger/push (bos_ledger_ingress.c
  * push_authorized): the BR's own persisted device_token, with the
  * compile-time CONFIG_BOS_SERVER_API_KEY as the same alternative.
@@ -38,26 +30,9 @@ static esp_err_t header_value(httpd_req_t *req, const char *name, char *out, siz
  * identical auth boundary. */
 bool bos_commissioning_request_authorized(httpd_req_t *req)
 {
-    char expected[BOS_COMMISSION_TOKEN_MAX];
-    char provided[BOS_COMMISSION_TOKEN_MAX];
-
-    if (bos_server_registration_get_token(expected, sizeof(expected)) == ESP_OK && expected[0] != '\0') {
-        if (header_value(req, "X-Device-Token", provided, sizeof(provided)) == ESP_OK &&
-            strcmp(expected, provided) == 0) {
-            return true;
-        }
-    }
-
-#ifdef CONFIG_BOS_SERVER_API_KEY
-    if (CONFIG_BOS_SERVER_API_KEY[0] != '\0') {
-        if (header_value(req, "x-api-key", provided, sizeof(provided)) == ESP_OK &&
-            strcmp(CONFIG_BOS_SERVER_API_KEY, provided) == 0) {
-            return true;
-        }
-    }
-#endif
-
-    return false;
+    /* Shared constant-time trust anchor (bos_auth, deduped 2026-08-24).
+     * The exported symbol stays: joiner/proxy/phonebook routes call it. */
+    return bos_auth_request_authorized(req);
 }
 
 /* Splits site-building-level-space-device on '-'. Exactly five non-empty

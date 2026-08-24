@@ -25,6 +25,7 @@ set(requires
     bos_convergence_aggregator
     bos_thread_dataset_anchor
     bos_diagnostics_server
+    bos_self_heal
 )
 
 if("${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}" VERSION_GREATER_EQUAL "5.3")
